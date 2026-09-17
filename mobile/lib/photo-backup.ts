@@ -1115,7 +1115,18 @@ export const deletePhotoBackup = async (photoId: string): Promise<void> => {
 export const cleanupUploadedPhotos = async (): Promise<number> => {
   try {
     const allMetadata = await getAllPhotoMetadata();
-    const uploaded = allMetadata.filter(m => m.uploaded);
+    // ✅ So apaga o arquivo fisico de foto que TEM url remota confirmada.
+    // Foto "zombie" (uploaded=true sem url) continua sendo re-tentada por
+    // getPendingPhotos; apagar o arquivo dela torna o re-upload impossivel
+    // e perde a foto em definitivo.
+    const uploaded = allMetadata.filter(m => m.uploaded && !!(m.uploadUrl || m.supabaseUrl));
+    const zombies = allMetadata.filter(m => m.uploaded && !(m.uploadUrl || m.supabaseUrl));
+
+    if (zombies.length > 0) {
+      logger.photos(
+        `[cleanupUploadedPhotos] ${zombies.length} foto(s) zombie preservada(s) para re-upload`
+      );
+    }
 
     let deletedCount = 0;
 
