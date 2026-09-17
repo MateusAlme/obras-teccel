@@ -7,67 +7,25 @@ import { processObraPhotos, UploadProgress } from './photo-queue';
 import { captureError } from './sentry';
 import { logger } from '../utils/logger';
 import { createEmergencyBackup, shouldCreateEmergencyBackup } from './emergency-backup';
+import * as obraStore from './obra-store';
 
 const PENDING_OBRAS_KEY = '@obras_pending_sync';
 const SYNC_STATUS_KEY = '@sync_status';
-const LOCAL_OBRAS_KEY = '@obras_local';
-// Chunked storage para @obras_local — evita o erro "Row too big" do SQLite Android (limite ~2MB por linha)
-const LOCAL_OBRAS_CHUNK_KEY = '@obras_local_c';
-const LOCAL_OBRAS_CHUNK_COUNT = '@obras_local_n';
-const OBRAS_CHUNK_MAX_BYTES = 1_400_000; // 1.4MB por chunk, bem abaixo do limite de 2MB
 
-/** Lê todas as obras locais independente do formato (chave única ou chunks). */
+// ⚡ Armazenamento de obras migrado para "uma chave por obra" (ver lib/obra-store.ts).
+// Escritas granulares (salvar 1 obra) deixaram de reserializar o dataset inteiro,
+// que era o maior peso do fluxo offline em celulares fracos.
+// readObrasRaw/writeObrasRaw permanecem como fachada para os fluxos que operam
+// sobre a lista completa (sync, dedupe). A migração do blob legado é automática.
+
+/** Lê todas as obras locais (fachada sobre a store). */
 async function readObrasRaw(): Promise<LocalObra[]> {
-  const nRaw = await AsyncStorage.getItem(LOCAL_OBRAS_CHUNK_COUNT);
-  if (nRaw) {
-    const n = parseInt(nRaw, 10);
-    if (n > 0) {
-      const keys = Array.from({ length: n }, (_, i) => `${LOCAL_OBRAS_CHUNK_KEY}${i}`);
-      const pairs = await AsyncStorage.multiGet(keys);
-      const all: LocalObra[] = [];
-      for (const [, chunk] of pairs) {
-        if (chunk) all.push(...(JSON.parse(chunk) as LocalObra[]));
-      }
-      return all;
-    }
-  }
-  const raw = await AsyncStorage.getItem(LOCAL_OBRAS_KEY);
-  return raw ? (JSON.parse(raw) as LocalObra[]) : [];
+  return obraStore.getAllObras();
 }
 
-/** Escreve obras locais, dividindo em chunks se necessário. */
+/** Substitui a lista completa de obras (fachada sobre a store). */
 async function writeObrasRaw(obras: LocalObra[]): Promise<void> {
-  const json = JSON.stringify(obras);
-  if (json.length <= OBRAS_CHUNK_MAX_BYTES) {
-    const nRaw = await AsyncStorage.getItem(LOCAL_OBRAS_CHUNK_COUNT);
-    if (nRaw) {
-      const oldN = parseInt(nRaw, 10);
-      const toRemove = [LOCAL_OBRAS_CHUNK_COUNT, ...Array.from({ length: oldN }, (_, i) => `${LOCAL_OBRAS_CHUNK_KEY}${i}`)];
-      await AsyncStorage.multiRemove(toRemove);
-    }
-    await AsyncStorage.setItem(LOCAL_OBRAS_KEY, json);
-    return;
-  }
-  const chunks: LocalObra[][] = [[]];
-  let used = 0;
-  for (const obra of obras) {
-    const s = JSON.stringify(obra);
-    if (used + s.length > OBRAS_CHUNK_MAX_BYTES && chunks[chunks.length - 1].length > 0) {
-      chunks.push([]);
-      used = 0;
-    }
-    chunks[chunks.length - 1].push(obra);
-    used += s.length;
-  }
-  const nRaw = await AsyncStorage.getItem(LOCAL_OBRAS_CHUNK_COUNT);
-  const oldN = nRaw ? parseInt(nRaw, 10) : 0;
-  const writes: [string, string][] = [
-    [LOCAL_OBRAS_CHUNK_COUNT, String(chunks.length)],
-    ...chunks.map((c, i) => [`${LOCAL_OBRAS_CHUNK_KEY}${i}`, JSON.stringify(c)] as [string, string]),
-  ];
-  await AsyncStorage.multiSet(writes);
-  const toRemove = [LOCAL_OBRAS_KEY, ...Array.from({ length: Math.max(0, oldN - chunks.length) }, (_, i) => `${LOCAL_OBRAS_CHUNK_KEY}${chunks.length + i}`)];
-  await AsyncStorage.multiRemove(toRemove);
+  return obraStore.replaceAllObras(obras);
 }
 
 /** Exportado para módulos externos que precisam salvar a lista completa de obras. */
@@ -415,39 +373,41 @@ export const saveObraLocal = async (
   existingId?: string
 ): Promise<string> => {
   try {
-    const localObras = await getLocalObras();
-
     // ✅ CORREÇÃO: Deduplicar somente rascunhos da MESMA obra/equipe/tipo
     // Isso evita sobrescrever books diferentes que compartilham o mesmo número.
     let finalExistingId = existingId;
     const hasExplicitObraId = typeof (obra as any).id === 'string' && String((obra as any).id).trim().length > 0;
     const incomingLegacyServicoId = String((obra as any).legacy_servico_id || '').trim();
     const canAutoDeduplicateDraft = !existingId && !hasExplicitObraId && incomingLegacyServicoId.length > 0;
-    const existingDraft = canAutoDeduplicateDraft
-      ? localObras.find(o =>
-          o.obra === obra.obra &&
-          o.equipe === obra.equipe &&
-          o.tipo_servico === obra.tipo_servico &&
-          String((o as any).legacy_servico_id || '').trim() === incomingLegacyServicoId &&
-          o.status === 'rascunho' &&
-          obra.status === 'rascunho' &&
-          !o.synced
-        )
-      : null;
 
-    if (existingDraft && canAutoDeduplicateDraft) {
-      finalExistingId = existingDraft.id; // Forçar atualização do rascunho
+    // Só carregamos a lista completa quando precisamos procurar um rascunho
+    // duplicado. No caso comum (autosave/edição) usamos leitura granular por id.
+    if (canAutoDeduplicateDraft) {
+      const localObras = await readObrasRaw();
+      const existingDraft = localObras.find(o =>
+        o.obra === obra.obra &&
+        o.equipe === obra.equipe &&
+        o.tipo_servico === obra.tipo_servico &&
+        String((o as any).legacy_servico_id || '').trim() === incomingLegacyServicoId &&
+        o.status === 'rascunho' &&
+        obra.status === 'rascunho' &&
+        !o.synced
+      );
+      if (existingDraft) {
+        finalExistingId = existingDraft.id; // Forçar atualização do rascunho
+      }
     }
 
     // Se tem ID existente, atualizar; senão, criar novo
     const obraId = finalExistingId || obra.id || `local_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 
-    const obraIndex = localObras.findIndex(o => o.id === obraId);
     const now = new Date().toISOString();
 
-    // ✅ CRÍTICO: Preservar serverId da obra existente se não vier no parâmetro
-    // Isso evita perder o link com o servidor após re-edição
-    const existingObra = obraIndex !== -1 ? localObras[obraIndex] : null;
+    // ⚡ Leitura granular: busca apenas a obra existente (se houver) por id.
+    // ✅ CRÍTICO: Preservar serverId/created_at/data da obra existente se não
+    // vierem no parâmetro — evita perder o link com o servidor após re-edição.
+    const existingObra = await obraStore.getObraById(obraId);
+    const exists = existingObra !== null;
     const serverId = (obra as any).serverId || existingObra?.serverId || null;
 
     logger.sync(`💾 saveObraLocal - obraId: ${obraId}, serverId existente: ${existingObra?.serverId}, serverId no param: ${(obra as any).serverId}, final: ${serverId}`);
@@ -458,24 +418,21 @@ export const saveObraLocal = async (
       // ✅ CRÍTICO: Preservar serverId para identificar obra no servidor
       ...(serverId && { serverId }),
       synced: false, // Sempre marca como não sincronizado (nova modificação)
-      locallyModified: obraIndex !== -1 || !!serverId, // Modificada se já existia ou se já foi para o servidor
+      locallyModified: exists || !!serverId, // Modificada se já existia ou se já foi para o servidor
       last_modified: now,
-      created_at: obraIndex !== -1 ? (existingObra?.created_at || obra.created_at || now) : (obra.created_at || now),
+      created_at: exists ? (existingObra?.created_at || obra.created_at || now) : (obra.created_at || now),
       // ✅ CRÍTICO: Preservar data original da obra (não sobrescrever com data atual)
-      data: obraIndex !== -1 ? (existingObra?.data || obra.data) : obra.data,
+      data: exists ? (existingObra?.data || obra.data) : obra.data,
     };
 
-    if (obraIndex !== -1) {
-      // Atualizar obra existente
-      localObras[obraIndex] = savedObra;
+    if (exists) {
       logger.sync(`📝 Obra local atualizada: ${obraId} (serverId: ${serverId || 'none'})`);
     } else {
-      // Adicionar nova obra
-      localObras.push(savedObra);
       logger.sync(`✅ Nova obra local criada: ${obraId} (serverId: ${serverId || 'none'})`);
     }
 
-    await writeObrasRaw(localObras);
+    // ⚡ Escrita granular: grava apenas esta obra, sem reserializar o dataset.
+    await obraStore.saveObra(savedObra);
 
     // NÃO sincroniza automaticamente - apenas salva local
     // Usuário decide quando sincronizar via botão manual
@@ -542,11 +499,48 @@ export const getLocalObras = async (): Promise<LocalObra[]> => {
  */
 export const getLocalObraById = async (id: string): Promise<LocalObra | null> => {
   try {
-    const localObras = await getLocalObras();
-    return localObras.find(o => o.id === id) || null;
+    // ⚡ Leitura granular: lê apenas a chave da obra, sem parsear todo o dataset.
+    const obra = await obraStore.getObraById(id);
+    if (!obra) return null;
+
+    // Preserva a rede de segurança do getLocalObras: se a obra está marcada como
+    // sincronizada mas ainda tem fotos pendentes, corrige para 'partial'.
+    const pendingPhotos = await getPendingPhotos();
+    if (
+      pendingPhotos.length &&
+      hasPendingPhotosForObra(obra, pendingPhotos) &&
+      !(obra.synced === false && obra.locallyModified && obra.sync_status === 'partial')
+    ) {
+      const corrigida: LocalObra = {
+        ...obra,
+        synced: false,
+        locallyModified: true,
+        sync_status: 'partial',
+      };
+      await obraStore.saveObra(corrigida);
+      return corrigida;
+    }
+
+    return obra;
   } catch (error) {
     logger.error('Erro ao obter obra local por ID:', error);
     return null;
+  }
+};
+
+/**
+ * Atualiza campos de uma obra local (escrita granular) sem sobrescrever o resto.
+ * Retorna false se a obra não existir localmente.
+ */
+export const updateLocalObraFields = async (
+  id: string,
+  patch: Partial<LocalObra>
+): Promise<boolean> => {
+  try {
+    return await obraStore.patchObra(id, patch);
+  } catch (error) {
+    logger.error('Erro ao atualizar campos da obra local:', error);
+    return false;
   }
 };
 
@@ -773,9 +767,8 @@ const updateObraInAsyncStorage = async (
  */
 export const removeLocalObra = async (id: string): Promise<void> => {
   try {
-    const localObras = await getLocalObras();
-    const filtered = localObras.filter(o => o.id !== id);
-    await writeObrasRaw(filtered);
+    // ⚡ Remoção granular: apaga apenas a chave da obra + índice.
+    await obraStore.removeObra(id);
     logger.sync(`🗑️ Obra local removida: ${id}`);
   } catch (error) {
     logger.error('Erro ao remover obra local:', error);

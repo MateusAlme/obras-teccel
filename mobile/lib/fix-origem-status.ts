@@ -4,11 +4,9 @@
  * USAR APENAS UMA VEZ para migrar obras antigas
  */
 
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from './supabase';
 import type { LocalObra } from './offline-sync';
-
-const LOCAL_OBRAS_KEY = '@obras_local';
+import * as obraStore from './obra-store';
 
 /**
  * Corrige obra comparando com dados do Supabase E remove duplicatas
@@ -23,13 +21,12 @@ export const fixObraOrigemStatus = async (): Promise<{
     console.log('🔧 Iniciando correção de obras...');
 
     // 1. Buscar todas as obras locais
-    const localObrasStr = await AsyncStorage.getItem(LOCAL_OBRAS_KEY);
-    if (!localObrasStr) {
+    const localObras: LocalObra[] = await obraStore.getAllObras();
+    if (!localObras.length) {
       console.log('⚠️ Nenhuma obra local encontrada');
       return { total: 0, corrigidas: 0, erros: 0, duplicatasRemovidas: 0 };
     }
 
-    const localObras: LocalObra[] = JSON.parse(localObrasStr);
     console.log(`📊 Total de obras locais (antes): ${localObras.length}`);
 
     // 2. PRIMEIRO: Remover duplicatas (manter apenas a mais recente de cada número)
@@ -206,8 +203,8 @@ export const fixObraOrigemStatus = async (): Promise<{
     }
 
     // 4. Salvar obras finais (únicas, corrigidas, sem deletadas)
-    await AsyncStorage.setItem(LOCAL_OBRAS_KEY, JSON.stringify(obrasFinais));
-    console.log(`\n💾 Obras salvas no AsyncStorage`);
+    await obraStore.replaceAllObras(obrasFinais);
+    console.log(`\n💾 Obras salvas no armazenamento local`);
 
     console.log('\n📊 RESUMO FINAL:');
     console.log(`  - Total inicial: ${localObras.length}`);
@@ -237,14 +234,13 @@ export const debugObra = async (obraNumero: string): Promise<void> => {
   try {
     console.log(`\n🔍 Debug da obra ${obraNumero}:`);
 
-    // Buscar no AsyncStorage
-    const localObrasStr = await AsyncStorage.getItem(LOCAL_OBRAS_KEY);
-    if (!localObrasStr) {
+    // Buscar no armazenamento local
+    const localObras: LocalObra[] = await obraStore.getAllObras();
+    if (!localObras.length) {
       console.log('❌ Nenhuma obra local encontrada');
       return;
     }
 
-    const localObras: LocalObra[] = JSON.parse(localObrasStr);
     const obraLocal = localObras.find(o => o.obra === obraNumero);
 
     if (!obraLocal) {

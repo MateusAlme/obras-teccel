@@ -12,6 +12,12 @@ supabase/
     └── 20250112_multiplas_fotos.sql  # Adiciona suporte a múltiplas fotos
 ```
 
+## Ambiente local de testes
+
+Pra testar sem escrever em produção, veja [AMBIENTE_LOCAL.md](./AMBIENTE_LOCAL.md)
+— sobe um Supabase completo (Postgres + Auth + Storage) em Docker via
+`./scripts/local-db-reset.sh`.
+
 ## Como Usar
 
 ### Primeira Vez (Novo Projeto)

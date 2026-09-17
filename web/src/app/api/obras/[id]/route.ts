@@ -1,11 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { deleteObraById } from '@/lib/obra-delete'
+import { requireAdmin } from '@/lib/api-auth'
 
 // DELETE: Excluir obra (apenas admin)
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireAdmin(request)
+  if (auth.error) return auth.error
+
   try {
     const { id: obraId } = await params
     const result = await deleteObraById(obraId)

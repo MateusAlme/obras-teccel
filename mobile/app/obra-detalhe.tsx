@@ -5,7 +5,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter, useFocusEffect } from 'expo-router';
 import NetInfo from '@react-native-community/netinfo';
 import type { PendingObra } from '../lib/offline-sync';
-import { getLocalObraById, forceUpdateObraFromSupabase, syncLocalObra, checkInternetConnection } from '../lib/offline-sync';
+import { getLocalObraById, forceUpdateObraFromSupabase, syncLocalObra, checkInternetConnection, updateLocalObraFields } from '../lib/offline-sync';
 import { getPhotosByObraWithFallback, type PhotoMetadata } from '../lib/photo-backup';
 import { supabase } from '../lib/supabase';
 
@@ -1362,31 +1362,20 @@ export default function ObraDetalhe() {
                 throw new Error('Erro ao sincronizar obra');
               }
 
-              // Buscar o novo serverId
-              const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
-              const LOCAL_OBRAS_KEY = '@obras_local';
-              const obrasJson = await AsyncStorage.getItem(LOCAL_OBRAS_KEY);
+              // Buscar o novo serverId (leitura granular pela store)
+              const obraAtualizada = await getLocalObraById(obra.id);
 
-              if (obrasJson) {
-                const obras = JSON.parse(obrasJson);
-                const obraAtualizada = obras.find((o: any) => o.id === obra.id);
-                if (obraAtualizada?.serverId) {
-                  // Atualizar estado local respeitando sync parcial (não forçar synced=true)
-                  setObra((prev: any) => prev ? {
-                    ...prev,
-                    serverId: obraAtualizada.serverId,
-                    synced: obraAtualizada.synced,
-                    sync_status: obraAtualizada.sync_status,
-                  } : prev);
-                }
+              if (obraAtualizada?.serverId) {
+                // Atualizar estado local respeitando sync parcial (não forçar synced=true)
+                setObra((prev: any) => prev ? {
+                  ...prev,
+                  serverId: obraAtualizada.serverId,
+                  synced: obraAtualizada.synced,
+                  sync_status: obraAtualizada.sync_status,
+                } : prev);
               }
 
-              const AsyncStorage2 = (await import('@react-native-async-storage/async-storage')).default;
-              const obrasJson2 = await AsyncStorage2.getItem(LOCAL_OBRAS_KEY);
-              const obraSincronizada = obrasJson2
-                ? JSON.parse(obrasJson2).find((o: any) => o.id === obra.id)
-                : null;
-              const syncCompleta = obraSincronizada?.synced !== false;
+              const syncCompleta = obraAtualizada?.synced !== false;
 
               if (syncCompleta) {
                 console.log('✅ Obra sincronizada com sucesso!');
@@ -1499,30 +1488,19 @@ export default function ObraDetalhe() {
 
               if (error) throw error;
 
-              // Atualizar AsyncStorage local com novo status
-              console.log('✅ Obra finalizada no Supabase, atualizando AsyncStorage...');
+              // Atualizar armazenamento local com novo status (escrita granular)
+              console.log('✅ Obra finalizada no Supabase, atualizando armazenamento local...');
               try {
-                const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
-                const LOCAL_OBRAS_KEY = '@obras_local';
-
-                const obrasJson = await AsyncStorage.getItem(LOCAL_OBRAS_KEY);
-                if (obrasJson) {
-                  const obras = JSON.parse(obrasJson);
-                  const obraIndex = obras.findIndex((o: any) => o.id === obra.id);
-
-                  if (obraIndex !== -1) {
-                    obras[obraIndex] = {
-                      ...obras[obraIndex],
-                      status: 'finalizada',
-                      finalizada_em: dataFechamento,
-                      data_fechamento: dataFechamento,
-                    };
-                    await AsyncStorage.setItem(LOCAL_OBRAS_KEY, JSON.stringify(obras));
-                    console.log('✅ AsyncStorage atualizado com status finalizada');
-                  }
+                const atualizada = await updateLocalObraFields(obra.id, {
+                  status: 'finalizada',
+                  finalizada_em: dataFechamento,
+                  data_fechamento: dataFechamento,
+                } as any);
+                if (atualizada) {
+                  console.log('✅ Armazenamento local atualizado com status finalizada');
                 }
               } catch (storageError) {
-                console.error('⚠️ Erro ao atualizar AsyncStorage:', storageError);
+                console.error('⚠️ Erro ao atualizar armazenamento local:', storageError);
               }
 
               Alert.alert('Sucesso', 'Obra finalizada com sucesso!', [

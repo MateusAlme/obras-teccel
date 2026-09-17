@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import ProtectedRoute from '@/components/ProtectedRoute'
 import AppShell from '@/components/AppShell'
 import { useAuth } from '@/contexts/AuthContext'
+import { authFetch } from '@/lib/api-client'
 import { format } from 'date-fns'
 import { ptBR } from 'date-fns/locale'
 import Image from 'next/image'
@@ -47,7 +48,7 @@ export default function UsersPage() {
   async function loadUsers() {
     try {
       setLoading(true)
-      const response = await fetch('/api/admin/users')
+      const response = await authFetch('/api/admin/users')
       const contentType = response.headers.get('content-type')
       if (!contentType || !contentType.includes('application/json')) {
         throw new Error('Resposta inválida do servidor.')
@@ -75,7 +76,7 @@ export default function UsersPage() {
           setSubmitting(false)
           return
         }
-        const response = await fetch('/api/admin/users', {
+        const response = await authFetch('/api/admin/users', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -89,7 +90,7 @@ export default function UsersPage() {
         if (!result.success) throw new Error(result.error || 'Erro ao criar usuário')
         setSuccess(`Usuário "${formData.email}" criado com sucesso!`)
       } else {
-        const response = await fetch(`/api/admin/users/${selectedUser!.id}`, {
+        const response = await authFetch(`/api/admin/users/${selectedUser!.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -115,7 +116,7 @@ export default function UsersPage() {
   async function handleDelete(user: AdminUser) {
     if (!confirm(`Excluir o usuário "${user.email}"?\n\nEsta ação não pode ser desfeita!`)) return
     try {
-      const response = await fetch(`/api/admin/users/${user.id}`, { method: 'DELETE' })
+      const response = await authFetch(`/api/admin/users/${user.id}`, { method: 'DELETE' })
       const result = await response.json()
       if (!result.success) throw new Error(result.error || 'Erro ao excluir usuário')
       setSuccess(`Usuário "${user.email}" excluído com sucesso!`)

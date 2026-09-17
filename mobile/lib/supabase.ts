@@ -2,8 +2,12 @@ import 'react-native-url-polyfill/auto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = 'https://hiuagpzaelcocyxutgdt.supabase.co';
-const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhpdWFncHphZWxjb2N5eHV0Z2R0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE3NDE1ODAsImV4cCI6MjA3NzMxNzU4MH0.sEp1yx9p_RGPWUIQ1bzE2aYx1YdPiKHFZJ-GnG4a-N8';
+// EXPO_PUBLIC_SUPABASE_* (mobile/.env.local) permite apontar o app pro Supabase
+// LOCAL de testes (scripts/local-db-reset.sh) sem tocar em produção. Sem essas
+// vars — inclusive em qualquer build EAS, já que .env.local não sobe pro build
+// (ver mobile/.gitignore) — cai no fallback de produção abaixo.
+const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || 'https://hiuagpzaelcocyxutgdt.supabase.co';
+const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhpdWFncHphZWxjb2N5eHV0Z2R0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE3NDE1ODAsImV4cCI6MjA3NzMxNzU4MH0.sEp1yx9p_RGPWUIQ1bzE2aYx1YdPiKHFZJ-GnG4a-N8';
 
 // Função para obter equipe logada
 const getEquipeLogada = async (): Promise<string | null> => {

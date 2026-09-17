@@ -1,11 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { updateAdminUser, changeAdminUserPassword, deleteAdminUser } from '@/lib/supabase-admin'
+import { requireAdmin } from '@/lib/api-auth'
 
 // PUT: Atualizar usuário admin
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireAdmin(request)
+  if (auth.error) return auth.error
+
   try {
     const body = await request.json()
     const { full_name, role, password } = body
@@ -39,6 +43,9 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireAdmin(request)
+  if (auth.error) return auth.error
+
   try {
     const { id: userId } = await params
     await deleteAdminUser(userId)
