@@ -1627,6 +1627,15 @@ export default function ReportsPage() {
                     obrasOnly.forEach(obra => {
                       const childServicos = servicosByParentId.get(obra.id) || []
 
+                      // Obra que já tem serviços não vira linha própria: os dados
+                      // (fotos, status) vivem no serviço, então a linha-pai apareceria
+                      // sempre vazia e seria lida como uma duplicata da obra.
+                      // Obras antigas, sem serviços, continuam aparecendo sozinhas.
+                      if (childServicos.length > 0) {
+                        childServicos.forEach(servico => rows.push(renderServicoRow(servico)))
+                        return
+                      }
+
                       // ── Obra (parent) row ──
                       rows.push(
                         <tr
@@ -1681,10 +1690,7 @@ export default function ReportsPage() {
                         </tr>
                       )
 
-                      // ── Child servico rows (always visible, flat rows) ──
-                      childServicos.forEach(servico => {
-                        rows.push(renderServicoRow(servico))
-                      })
+                      // Serviços filhos já foram emitidos acima, no lugar da linha-pai.
                     })
 
                     // ── Orphan services (parent filtered out) ──

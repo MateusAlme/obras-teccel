@@ -2588,6 +2588,10 @@ export const syncObra = async (
       // Atualizar fotos com o ID correto do servidor
       try {
         await updatePhotosObraId(obra.id, existingSameBook.id);
+        // Os servicos precisam do mesmo reapontamento: sem ele, continuam
+        // procurando uma obra local que deixou de existir.
+        const { updateServicosObraId } = await import('./servico-sync');
+        await updateServicosObraId(obra.id, existingSameBook.id);
       } catch (photoError) {
         logger.error('Erro ao atualizar obraId das fotos (não crítico):', photoError);
       }
@@ -2721,6 +2725,10 @@ export const syncObra = async (
       try {
         const updatedCount = await updatePhotosObraId(obra.id, insertedObra.id);
         logger.sync(`✅ ${updatedCount} foto(s) atualizadas com novo obraId: ${insertedObra.id}`);
+        // Os servicos tambem apontam para o id local. Sem reapontar, eles ficam
+        // orfaos: procuram uma obra que nao existe mais e nunca conseguem subir.
+        const { updateServicosObraId } = await import('./servico-sync');
+        await updateServicosObraId(obra.id, insertedObra.id);
       } catch (photoUpdateError) {
         logger.error('Erro ao atualizar obraId das fotos (não crítico):', photoUpdateError);
         // Não propaga erro - sincronização foi bem sucedida

@@ -4,6 +4,41 @@ import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import * as Sentry from '@sentry/react-native';
+<<<<<<< HEAD
+import Constants, { ExecutionEnvironment } from 'expo-constants';
+import { logger } from '../utils/logger';
+
+// 📱 No Expo Go nao existe codigo nativo do Sentry: mobileReplayIntegration e
+// feedbackIntegration derrubam o app no boot (crash nativo, antes do ErrorBoundary).
+// No development build / APK os modulos existem e tudo roda normalmente.
+const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreClient;
+
+// Telemetria nunca pode derrubar o app: se o init falhar, seguimos sem Sentry.
+try {
+  Sentry.init({
+    dsn: 'https://b99f587e416bd6510cce46af64b4fbf1@o4510794867671040.ingest.de.sentry.io/4510874270433360',
+
+    // Adds more context data to events (IP address, cookies, user, etc.)
+    // For more information, visit: https://docs.sentry.io/platforms/react-native/data-management/data-collected/
+    sendDefaultPii: true,
+
+    // Enable Logs
+    enableLogs: true,
+
+    // Configure Session Replay (indisponivel no Expo Go)
+    replaysSessionSampleRate: isExpoGo ? 0 : 0.1,
+    replaysOnErrorSampleRate: isExpoGo ? 0 : 1,
+    integrations: isExpoGo
+      ? []
+      : [Sentry.mobileReplayIntegration(), Sentry.feedbackIntegration()],
+
+    // uncomment the line below to enable Spotlight (https://spotlightjs.com)
+    // spotlight: __DEV__,
+  });
+} catch (error) {
+  console.warn('⚠️ [WARN] Sentry nao inicializado:', error);
+}
+=======
 import { logger } from '../utils/logger';
 
 Sentry.init({
@@ -24,6 +59,7 @@ Sentry.init({
   // uncomment the line below to enable Spotlight (https://spotlightjs.com)
   // spotlight: __DEV__,
 });
+>>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
 
 // Prevent the splash screen from auto-hiding
 SplashScreen.preventAutoHideAsync();

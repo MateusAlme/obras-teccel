@@ -27,6 +27,34 @@ const STALE_UPLOADING_MS = 150_000; // "uploading" sem atualizacao por 2m30s vol
 const SUPABASE_STORAGE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL || 'https://hiuagpzaelcocyxutgdt.supabase.co';
 const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhpdWFncHphZWxjb2N5eHV0Z2R0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE3NDE1ODAsImV4cCI6MjA3NzMxNzU4MH0.sEp1yx9p_RGPWUIQ1bzE2aYx1YdPiKHFZJ-GnG4a-N8';
 
+/**
+ * Qualidade da conexao atual.
+ *
+ * Em rede lenta o app NAO tenta enviar: a foto fica guardada no dispositivo, na
+ * qualidade original, e sobe quando a conexao permitir. Tentar em 2G/3G fraco so
+ * produz timeout, gasta bateria e dados, e arrisca marcar como problematica uma
+ * foto que esta intacta.
+ */
+export type ConnectionQuality = 'offline' | 'lenta' | 'boa';
+
+export const getConnectionQuality = async (): Promise<ConnectionQuality> => {
+  try {
+    const net = await NetInfo.fetch();
+    const online = net.isConnected === true && net.isInternetReachable !== false;
+    if (!online) return 'offline';
+
+    const details: any = net.details || {};
+    const geracao = String(details.cellularGeneration || '').toLowerCase();
+    // 2G e 3G nao sustentam upload de foto com seguranca.
+    if (net.type === 'cellular' && (geracao === '2g' || geracao === '3g')) return 'lenta';
+
+    return 'boa';
+  } catch {
+    // Sem informacao confiavel, assume boa e deixa o timeout decidir.
+    return 'boa';
+  }
+};
+
 interface UploadToSupabaseResult {
   success: boolean;
   url?: string;
@@ -757,17 +785,26 @@ export const processObraPhotos = async (
       return { success: 0, failed: 0, results: [] };
     }
 
-    const netState = await NetInfo.fetch();
-    const isOnline = netState.isConnected === true && netState.isInternetReachable !== false;
-    if (!isOnline) {
-      logger.photos(`[processObraPhotos] Sem conexão - obra ${obraId} permanece pendente`);
+    const qualidade = await getConnectionQuality();
+
+    // Offline e conexao lenta recebem o MESMO tratamento: a foto fica guardada,
+    // intacta, e o envio e adiado. Nenhuma tentativa e consumida e nenhum erro e
+    // registrado — nao ha nada de errado com a foto, so com a rede do momento.
+    if (qualidade !== 'boa') {
+      const motivo =
+        qualidade === 'offline'
+          ? 'Sem conexão com internet'
+          : 'Conexão lenta — envio adiado para quando a rede melhorar';
+      logger.photos(
+        `[processObraPhotos] ${motivo}: obra ${obraId} mantém ${obraPhotos.length} foto(s) pendente(s)`
+      );
       return {
         success: 0,
         failed: obraPhotos.length,
         results: obraPhotos.map((photo) => ({
           photoId: photo.id,
           success: false,
-          error: 'Sem conexão com internet',
+          error: motivo,
         })),
       };
     }

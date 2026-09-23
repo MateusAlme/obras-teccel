@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { listAdminUsers, createAdminUser } from '@/lib/supabase-admin'
+<<<<<<< HEAD
+
+// GET: Listar todos os usuários admin
+export async function GET(request: NextRequest) {
+=======
 import { requireAdmin } from '@/lib/api-auth'
 
 // GET: Listar todos os usuários admin
@@ -7,6 +12,7 @@ export async function GET(request: NextRequest) {
   const auth = await requireAdmin(request)
   if (auth.error) return auth.error
 
+>>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
   try {
     const users = await listAdminUsers()
     return NextResponse.json({ success: true, data: users })
@@ -21,9 +27,12 @@ export async function GET(request: NextRequest) {
 
 // POST: Criar novo usuário admin
 export async function POST(request: NextRequest) {
+<<<<<<< HEAD
+=======
   const auth = await requireAdmin(request)
   if (auth.error) return auth.error
 
+>>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
   try {
     const body = await request.json()
     const { email, password, full_name, role } = body

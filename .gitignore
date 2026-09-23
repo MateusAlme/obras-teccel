@@ -45,7 +45,9 @@ expo-env.d.ts
 
 # Claude / agentes (contém symlinks que quebram o EAS Build)
 .agents/
-.claude/
+.claude/*
+!.claude/skills/
+!.claude/launch.json
 *.swp
 *.swo
 *~

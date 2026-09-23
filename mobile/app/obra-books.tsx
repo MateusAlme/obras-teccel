@@ -1303,19 +1303,27 @@ export default function ObraBooksPage() {
     return () => clearTimeout(timer);
   }, [findCreatedServiceCandidate, loadData, pendingNewServiceFocus]);
 
-  const handleMarkServiceComplete = async (servico: Servico) => {
+  const handleMarkServiceComplete = async (
+    servico: Servico,
+    opcoes?: { concluirDireto?: boolean }
+  ) => {
+    // Tipos com tela propria abrem a tela quando a acao vem do fluxo de edicao.
+    // Vindo do botao "Marcar Completo" do card, o usuario quer CONCLUIR ali mesmo —
+    // abrir a tela seria ignorar o que ele pediu.
+    const concluirDireto = opcoes?.concluirDireto === true;
+
     // Serviços com postes (Cava em Rocha, Linha Viva, etc.) → redireciona para a tela de postes
-    if (SERVICOS_COM_POSTES_SCREEN.has(servico.tipo_servico) && !usesLegacyDetalheFlow(servico.tipo_servico, (servico as any).client_pk)) {
+    if (!concluirDireto && SERVICOS_COM_POSTES_SCREEN.has(servico.tipo_servico) && !usesLegacyDetalheFlow(servico.tipo_servico, (servico as any).client_pk)) {
       void openPostesRegistro(servico);
       return;
     }
     // Transformador → tela dedicada
-    if (servico.tipo_servico === 'Transformador' && !usesLegacyDetalheFlow(servico.tipo_servico, (servico as any).client_pk)) {
+    if (!concluirDireto && servico.tipo_servico === 'Transformador' && !usesLegacyDetalheFlow(servico.tipo_servico, (servico as any).client_pk)) {
       void openTransformador(servico);
       return;
     }
     // Checklist de Fiscalização → tela dedicada
-    if (servico.tipo_servico === 'Checklist de Fiscalização' && !usesLegacyDetalheFlow(servico.tipo_servico, (servico as any).client_pk)) {
+    if (!concluirDireto && servico.tipo_servico === 'Checklist de Fiscalização' && !usesLegacyDetalheFlow(servico.tipo_servico, (servico as any).client_pk)) {
       void openChecklistFiscalizacao(servico);
       return;
     }
@@ -2658,7 +2666,7 @@ export default function ObraBooksPage() {
                       }}
                       onMarkComplete={(servicoId) => {
                         void servicoId; // evita lookup por id que pode conflitar em listas mistas
-                        handleMarkServiceComplete(servico);
+                        handleMarkServiceComplete(servico, { concluirDireto: true });
                       }}
                     />
                   </View>
