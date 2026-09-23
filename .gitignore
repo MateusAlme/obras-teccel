@@ -77,3 +77,6 @@ Thumbs.db
 # Windows
 desktop.ini
 $RECYCLE.BIN/
+
+# Credenciais da migracao para a VPS
+scripts/migracao-vps/.env.backup
