@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
-  ScrollView,
+  FlatList,
   TouchableOpacity,
   Alert,
   ActivityIndicator,
@@ -139,6 +139,127 @@ export default function ObrasPendentes() {
   const pendingCount = pendingObras.filter((o) => o.sync_status === 'pending').length;
   const failedCount = pendingObras.filter((o) => o.sync_status === 'failed').length;
 
+  const renderObra = useCallback(
+    ({ item: obra }: { item: PendingObra }) => (
+      <View style={styles.obraCard}>
+        <View style={styles.obraHeader}>
+          <View style={styles.obraInfo}>
+            <Text style={styles.obraTitle}>{obra.obra}</Text>
+            <Text style={styles.obraDate}>{obra.data}</Text>
+          </View>
+          <View
+            style={[
+              styles.statusBadge,
+              { backgroundColor: getStatusColor(obra.sync_status) },
+            ]}
+          >
+            <Text style={styles.statusBadgeText}>
+              {getStatusLabel(obra.sync_status)}
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.obraDetails}>
+          <Text style={styles.obraDetail}>
+            👤 <Text style={styles.obraDetailBold}>{obra.responsavel}</Text>
+          </Text>
+          <Text style={styles.obraDetail}>
+            👥 <Text style={styles.obraDetailBold}>{obra.equipe}</Text>
+          </Text>
+          <Text style={styles.obraDetail}>
+            🔧 <Text style={styles.obraDetailBold}>{obra.tipo_servico}</Text>
+          </Text>
+          <Text style={styles.obraDetail}>
+            📸{' '}
+            <Text style={styles.obraDetailBold}>
+              {(obra.fotos_antes?.length || 0) +
+                (obra.fotos_durante?.length || 0) +
+                (obra.fotos_depois?.length || 0)}{' '}
+              foto(s)
+            </Text>
+          </Text>
+        </View>
+
+        {obra.error_message && (
+          <View style={styles.errorContainer}>
+            <Text style={styles.errorText}>❌ {obra.error_message}</Text>
+          </View>
+        )}
+
+        {(obra.sync_status === 'pending' || obra.sync_status === 'failed') && (
+          <TouchableOpacity
+            style={[
+              styles.retryButton,
+              (syncing && syncingId !== obra.id) && styles.buttonDisabled,
+            ]}
+            onPress={() => handleSyncOne(obra)}
+            disabled={syncing}
+          >
+            {syncing && syncingId === obra.id ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <Text style={styles.retryButtonText}>
+                {obra.sync_status === 'failed'
+                  ? '🔄 Tentar Novamente'
+                  : '📤 Sincronizar Agora'}
+              </Text>
+            )}
+          </TouchableOpacity>
+        )}
+      </View>
+    ),
+    [syncing, syncingId]
+  );
+
+  const ListHeader = (
+    <>
+      {/* Cards de Estatísticas */}
+      <View style={styles.statsContainer}>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{pendingCount}</Text>
+          <Text style={styles.statLabel}>Pendentes</Text>
+        </View>
+
+        <View style={styles.statCard}>
+          <Text style={[styles.statValue, styles.statValueError]}>{failedCount}</Text>
+          <Text style={styles.statLabel}>Falharam</Text>
+        </View>
+
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{pendingObras.length}</Text>
+          <Text style={styles.statLabel}>Total</Text>
+        </View>
+      </View>
+
+      {/* Botão de Sincronizar Todas */}
+      {pendingObras.length > 0 && (
+        <TouchableOpacity
+          style={[styles.syncAllButton, syncing && styles.buttonDisabled]}
+          onPress={handleSyncAll}
+          disabled={syncing}
+        >
+          {syncing ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={styles.syncAllButtonText}>
+              🔄 Sincronizar Todas ({pendingObras.length})
+            </Text>
+          )}
+        </TouchableOpacity>
+      )}
+    </>
+  );
+
+  const ListEmpty = (
+    <View style={styles.emptyState}>
+      <Text style={styles.emptyStateIcon}>✅</Text>
+      <Text style={styles.emptyStateTitle}>Tudo sincronizado!</Text>
+      <Text style={styles.emptyStateText}>
+        Não há obras pendentes de sincronização
+      </Text>
+    </View>
+  );
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.header}>
@@ -148,124 +269,20 @@ export default function ObrasPendentes() {
         <Text style={styles.title}>Obras Pendentes</Text>
       </View>
 
-      <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
-        {/* Cards de Estatísticas */}
-        <View style={styles.statsContainer}>
-          <View style={styles.statCard}>
-            <Text style={styles.statValue}>{pendingCount}</Text>
-            <Text style={styles.statLabel}>Pendentes</Text>
-          </View>
-
-          <View style={styles.statCard}>
-            <Text style={[styles.statValue, styles.statValueError]}>{failedCount}</Text>
-            <Text style={styles.statLabel}>Falharam</Text>
-          </View>
-
-          <View style={styles.statCard}>
-            <Text style={styles.statValue}>{pendingObras.length}</Text>
-            <Text style={styles.statLabel}>Total</Text>
-          </View>
-        </View>
-
-        {/* Botão de Sincronizar Todas */}
-        {pendingObras.length > 0 && (
-          <TouchableOpacity
-            style={[styles.syncAllButton, syncing && styles.buttonDisabled]}
-            onPress={handleSyncAll}
-            disabled={syncing}
-          >
-            {syncing ? (
-              <ActivityIndicator size="small" color="#fff" />
-            ) : (
-              <Text style={styles.syncAllButtonText}>
-                🔄 Sincronizar Todas ({pendingObras.length})
-              </Text>
-            )}
-          </TouchableOpacity>
-        )}
-
-        {/* Lista de Obras */}
-        {pendingObras.length === 0 ? (
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyStateIcon}>✅</Text>
-            <Text style={styles.emptyStateTitle}>Tudo sincronizado!</Text>
-            <Text style={styles.emptyStateText}>
-              Não há obras pendentes de sincronização
-            </Text>
-          </View>
-        ) : (
-          <View style={styles.obrasContainer}>
-            {pendingObras.map((obra) => (
-              <View key={`pending_${obra.id}`} style={styles.obraCard}>
-                <View style={styles.obraHeader}>
-                  <View style={styles.obraInfo}>
-                    <Text style={styles.obraTitle}>{obra.obra}</Text>
-                    <Text style={styles.obraDate}>{obra.data}</Text>
-                  </View>
-                  <View
-                    style={[
-                      styles.statusBadge,
-                      { backgroundColor: getStatusColor(obra.sync_status) },
-                    ]}
-                  >
-                    <Text style={styles.statusBadgeText}>
-                      {getStatusLabel(obra.sync_status)}
-                    </Text>
-                  </View>
-                </View>
-
-                <View style={styles.obraDetails}>
-                  <Text style={styles.obraDetail}>
-                    👤 <Text style={styles.obraDetailBold}>{obra.responsavel}</Text>
-                  </Text>
-                  <Text style={styles.obraDetail}>
-                    👥 <Text style={styles.obraDetailBold}>{obra.equipe}</Text>
-                  </Text>
-                  <Text style={styles.obraDetail}>
-                    🔧 <Text style={styles.obraDetailBold}>{obra.tipo_servico}</Text>
-                  </Text>
-                  <Text style={styles.obraDetail}>
-                    📸{' '}
-                    <Text style={styles.obraDetailBold}>
-                      {(obra.fotos_antes?.length || 0) +
-                        (obra.fotos_durante?.length || 0) +
-                        (obra.fotos_depois?.length || 0)}{' '}
-                      foto(s)
-                    </Text>
-                  </Text>
-                </View>
-
-                {obra.error_message && (
-                  <View style={styles.errorContainer}>
-                    <Text style={styles.errorText}>❌ {obra.error_message}</Text>
-                  </View>
-                )}
-
-                {(obra.sync_status === 'pending' || obra.sync_status === 'failed') && (
-                  <TouchableOpacity
-                    style={[
-                      styles.retryButton,
-                      (syncing && syncingId !== obra.id) && styles.buttonDisabled,
-                    ]}
-                    onPress={() => handleSyncOne(obra)}
-                    disabled={syncing}
-                  >
-                    {syncing && syncingId === obra.id ? (
-                      <ActivityIndicator size="small" color="#fff" />
-                    ) : (
-                      <Text style={styles.retryButtonText}>
-                        {obra.sync_status === 'failed'
-                          ? '🔄 Tentar Novamente'
-                          : '📤 Sincronizar Agora'}
-                      </Text>
-                    )}
-                  </TouchableOpacity>
-                )}
-              </View>
-            ))}
-          </View>
-        )}
-      </ScrollView>
+      <FlatList
+        style={styles.container}
+        contentContainerStyle={styles.scrollContent}
+        data={pendingObras}
+        keyExtractor={(obra) => `pending_${obra.id}`}
+        renderItem={renderObra}
+        ListHeaderComponent={ListHeader}
+        ListEmptyComponent={ListEmpty}
+        ItemSeparatorComponent={() => <View style={styles.separator} />}
+        removeClippedSubviews
+        initialNumToRender={8}
+        maxToRenderPerBatch={8}
+        windowSize={7}
+      />
     </SafeAreaView>
   );
 }
@@ -377,6 +394,9 @@ const styles = StyleSheet.create({
   },
   obrasContainer: {
     gap: 16,
+  },
+  separator: {
+    height: 16,
   },
   obraCard: {
     backgroundColor: '#fff',

@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { deleteObrasByIds } from '@/lib/obra-delete'
+import { requireAdmin } from '@/lib/api-auth'
 
 export async function POST(request: NextRequest) {
+  const auth = await requireAdmin(request)
+  if (auth.error) return auth.error
+
   try {
     const body = await request.json()
     const obraIds = Array.isArray(body?.obraIds) ? body.obraIds.filter((id: unknown) => typeof id === 'string') : []

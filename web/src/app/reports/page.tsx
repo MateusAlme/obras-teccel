@@ -11,6 +11,7 @@ import { ptBR } from 'date-fns/locale'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/contexts/AuthContext'
 import { addFotosSheet, type FotoGroup } from '@/lib/xlsx-photos'
+import { authFetch } from '@/lib/api-client'
 
 const REPORT_PHOTO_SECTIONS: { key: keyof Obra; label: string; color: string; lightColor: string }[] = [
   { key: 'fotos_antes', label: 'Fotos Antes', color: 'blue', lightColor: 'blue' },
@@ -1072,7 +1073,7 @@ export default function ReportsPage() {
         const { error } = await supabase.from('servicos').delete().eq('id', realId)
         if (error) throw error
       } else {
-        const response = await fetch(`/api/obras/${obra.id}`, { method: 'DELETE' })
+        const response = await authFetch(`/api/obras/${obra.id}`, { method: 'DELETE' })
         const result = await response.json()
         if (!result.success) throw new Error(result.error || `Erro ao excluir ${label}`)
       }
@@ -1121,7 +1122,7 @@ export default function ReportsPage() {
     setMenuPosition(null)
 
     try {
-      const response = await fetch('/api/obras/bulk-delete', {
+      const response = await authFetch('/api/obras/bulk-delete', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

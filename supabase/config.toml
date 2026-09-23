@@ -50,7 +50,14 @@ max_client_conn = 100
 
 [db.migrations]
 # If disabled, migrations will be skipped during a db push or reset.
-enabled = true
+# Desabilitado propositalmente: várias migrations datadas só por dia (ex.:
+# duas em 20250202) colidem na PK schema_migrations.version do tracking do
+# CLI, porque em produção elas nunca foram aplicadas via CLI — foram coladas
+# manualmente no SQL Editor do Supabase, sem esse tracking. Aplicamos via
+# scripts/local-db-reset.sh, que roda os .sql em ordem cronológica com psql
+# puro (fiel a como o schema real foi construído), sem depender da tabela de
+# tracking. Ver docs/supabase/AMBIENTE_LOCAL.md.
+enabled = false
 # Specifies an ordered list of schema files that describe your database.
 # Supports glob patterns relative to supabase directory: "./schemas/*.sql"
 schema_paths = []

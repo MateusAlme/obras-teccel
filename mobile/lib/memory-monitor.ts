@@ -44,13 +44,17 @@ export const getMemoryInfo = async (): Promise<MemoryInfo> => {
       '@photo_metadata_archived',
       '@photo_upload_queue',
       '@obras_pending_sync',
+      '@obras_index',
+      // Legado (podem não existir mais após a migração para chaves por obra):
       '@obras_local',
       '@obras_local_n',
     ];
     const allKeys = await AsyncStorage.getAllKeys();
+    // Novo modelo: uma chave por obra (@obra:<id>). Legado: chunks (@obras_local_c<i>).
+    const obraKeys = allKeys.filter((k) => k.startsWith('@obra:'));
     const obrasChunkKeys = allKeys.filter((k) => k.startsWith('@obras_local_c'));
     const queueChunkKeys = allKeys.filter((k) => k.startsWith('@photo_upload_queue_c'));
-    const keysToMeasure = [...CRITICAL_KEYS, ...obrasChunkKeys, ...queueChunkKeys];
+    const keysToMeasure = [...CRITICAL_KEYS, ...obraKeys, ...obrasChunkKeys, ...queueChunkKeys];
     const pairs = await AsyncStorage.multiGet(keysToMeasure);
     const totalSize = pairs.reduce((sum, [, value]) => sum + (value?.length || 0), 0);
 

@@ -239,6 +239,10 @@ export default function BuscarObra() {
         renderItem={renderItem}
         contentContainerStyle={styles.listContent}
         keyboardShouldPersistTaps="handled"
+        removeClippedSubviews
+        initialNumToRender={8}
+        maxToRenderPerBatch={8}
+        windowSize={7}
         ListEmptyComponent={
           buscando ? null : (
             <View style={styles.emptyCard}>
