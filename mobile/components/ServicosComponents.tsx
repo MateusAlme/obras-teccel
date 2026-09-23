@@ -178,17 +178,18 @@ const ObraContainerComponent: React.FC<ObraContainerProps> = ({
         activeOpacity={0.75}
       >
         <View style={styles.obraHeaderContent}>
-          {/* Icon + Location */}
+          {/* Data (secundaria) */}
           <View style={styles.locationRow}>
-            <Ionicons name="location" size={14} color={colors.textTertiary} />
+            <Ionicons name="calendar-outline" size={14} color={colors.textTertiary} />
             <Text style={styles.locationText} numberOfLines={1}>
-              {obraTitle}
+              {obraData}
             </Text>
           </View>
 
-          {/* Title */}
+          {/* Numero da obra: e por ele que a equipe identifica e procura a obra,
+              entao ele e o titulo do card. A data fica como informacao de apoio. */}
           <Text style={styles.obraTitle} numberOfLines={1}>
-            Obra {obraData}
+            {obraTitle}
           </Text>
 
           {/* Meta info */}
@@ -1181,7 +1182,11 @@ const ServiceCardComponent: React.FC<ServiceCardProps> = ({
 
               {/* Actions */}
               <View style={styles.serviceActions}>
-                {service.status !== 'completo' && !SERVICOS_COM_TELA_PROPRIA.has(service.tipo_servico) && (
+                {/* Concluir direto no card tambem para os tipos com tela propria
+                    (Checklist, Transformador, postes): a validacao de fotos
+                    obrigatorias e a mesma, e obrigar a abrir a tela so para
+                    concluir custava um passo sem ganho. */}
+                {service.status !== 'completo' && (
                   <TouchableOpacity
                     style={[styles.actionBtn, styles.primaryBtn]}
                     onPress={() => onMarkComplete(service.id)}

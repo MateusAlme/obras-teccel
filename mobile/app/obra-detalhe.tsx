@@ -6,7 +6,8 @@ import { useLocalSearchParams, useRouter, useFocusEffect } from 'expo-router';
 import NetInfo from '@react-native-community/netinfo';
 import type { PendingObra } from '../lib/offline-sync';
 import { getLocalObraById, forceUpdateObraFromSupabase, syncLocalObra, checkInternetConnection } from '../lib/offline-sync';
-import { getPhotosByObraWithFallback, type PhotoMetadata } from '../lib/photo-backup';
+import { getPhotosByObraWithFallback, getPendingPhotos, type PhotoMetadata } from '../lib/photo-backup';
+import { getConnectionQuality, type ConnectionQuality } from '../lib/photo-queue';
 import { supabase } from '../lib/supabase';
 
 type FotoInfo = {
@@ -367,6 +368,9 @@ export default function ObraDetalhe() {
   const [isOnline, setIsOnline] = useState(true);
   const [isFinalizando, setIsFinalizando] = useState(false);
   const [isSincronizando, setIsSincronizando] = useState(false);
+  // Fotos desta obra que ainda nao subiram, para a equipe saber que nada ficou para tras.
+  const [fotosAguardando, setFotosAguardando] = useState(0);
+  const [qualidadeConexao, setQualidadeConexao] = useState<ConnectionQuality>('boa');
   const insets = useSafeAreaInsets();
   const { width: screenWidth } = useWindowDimensions();
   const isSmallScreen = screenWidth < 390;
@@ -409,6 +413,36 @@ export default function ObraDetalhe() {
         refreshObraData();
       }
     }, [data, obra?.id])
+  );
+
+  // Conta as fotos desta obra que ainda nao subiram. Roda ao focar a tela e a cada
+  // 15s enquanto ela estiver aberta, para o numero acompanhar o envio em andamento.
+  useFocusEffect(
+    useCallback(() => {
+      let ativo = true;
+      const contar = async () => {
+        try {
+          const [pendentes, qualidade] = await Promise.all([
+            getPendingPhotos(),
+            getConnectionQuality(),
+          ]);
+          if (!ativo) return;
+          const idsDaObra = new Set(
+            [obra?.id, (obra as any)?.serverId].filter(Boolean) as string[]
+          );
+          setFotosAguardando(pendentes.filter((p) => idsDaObra.has(p.obraId)).length);
+          setQualidadeConexao(qualidade);
+        } catch {
+          // Indicador e informativo: falhar aqui nao pode atrapalhar a tela.
+        }
+      };
+      contar();
+      const timer = setInterval(contar, 15000);
+      return () => {
+        ativo = false;
+        clearInterval(timer);
+      };
+    }, [obra?.id, (obra as any)?.serverId])
   );
 
   const loadObraData = async () => {
@@ -1663,6 +1697,31 @@ export default function ObraDetalhe() {
           )}
         </View>
 
+        {/* Fotos guardadas no aparelho, aguardando rede para subir.
+            Fica FORA do bloco de botoes: obra finalizada tambem pode ter foto
+            pendente, e e justamente o caso em que ninguem mais iria olhar. */}
+        {fotosAguardando > 0 && (
+          <View style={styles.aguardandoBanner}>
+            <Ionicons
+              name={qualidadeConexao === 'boa' ? 'cloud-upload-outline' : 'cloud-offline-outline'}
+              size={20}
+              color="#B45309"
+            />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.aguardandoTitulo}>
+                {fotosAguardando} foto{fotosAguardando > 1 ? 's' : ''} aguardando envio
+              </Text>
+              <Text style={styles.aguardandoTexto}>
+                {qualidadeConexao === 'offline'
+                  ? 'Sem conexão. Ficam salvas no aparelho e sobem sozinhas quando houver internet.'
+                  : qualidadeConexao === 'lenta'
+                    ? 'Conexão lenta. O envio foi adiado para preservar a qualidade — nada foi perdido.'
+                    : 'Enviando em segundo plano.'}
+              </Text>
+            </View>
+          </View>
+        )}
+
         {/* Botões de ação */}
         {obra.status !== 'finalizada' && (() => {
           const { total: fotosFaltantes, detalhes: fotosFaltantesDetalhes } = calcularFotosFaltantes();
@@ -2757,6 +2816,28 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   // Estilos do botão Sincronizar
+  aguardandoBanner: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    marginTop: 8,
+    padding: 12,
+    borderRadius: 10,
+    backgroundColor: '#FEF3C7',
+    borderLeftWidth: 3,
+    borderLeftColor: '#B45309',
+  },
+  aguardandoTitulo: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#78350F',
+  },
+  aguardandoTexto: {
+    fontSize: 12,
+    color: '#92400E',
+    marginTop: 2,
+    lineHeight: 16,
+  },
   sincronizarButton: {
     flexDirection: 'row',
     alignItems: 'center',

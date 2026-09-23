@@ -9,8 +9,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import { captureError } from './sentry';
 import { logger } from '../utils/logger';
-import { processObraPhotos } from './photo-queue';
-import { getAllPhotoMetadata, getPhotoMetadatasByIds, deletePhotoBackup, resetLostPhotosByIds, ensurePhotoMetadataFromUri, ensurePhotoMetadataById, type PhotoMetadata } from './photo-backup';
+import { processObraPhotos, getConnectionQuality } from './photo-queue';
+import { getAllPhotoMetadata, getPhotoMetadatasByIds, deletePhotoBackup, resetLostPhotosByIds, ensurePhotoMetadataFromUri, ensurePhotoMetadataById, photoExists, type PhotoMetadata } from './photo-backup';
 import { getLocalObras } from './offline-sync';
 
 const PENDING_SERVICOS_KEY = '@servicos_pending_sync';
@@ -32,6 +32,10 @@ const MAX_SERVICO_RETRIES = 5; // Mximo de tentativas antes de desistir
 // Lock global para syncAllPendingServicos a evita execuAAes concorrentes (timers + telas)
 // que causam INSERT duplicado quando client_pk ainda nÃ£o estÃ¡ na DB
 let syncAllPendingServicosInProgress = false;
+
+// Servicos ja reportados como "sem arquivo local para reenviar". Evita repetir o
+// mesmo aviso a cada ciclo de sync — o estado nao muda sozinho.
+const servicosSemArquivoReportados = new Set<string>();
 
 const isUuid = (value: string): boolean => {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -487,6 +491,62 @@ export async function getLocalServicos(obraId: string): Promise<ServicoLocal[]> 
 }
 
 /**
+ * Reaponta os servicos de uma obra do id local para o id definitivo do servidor.
+ *
+ * Equivale ao que updatePhotosObraId faz com as fotos. Sem isso, quando a obra
+ * sincroniza e passa a ser guardada sob o UUID do servidor, os servicos continuam
+ * apontando para um id local que nao existe mais — e ficam presos, incapazes de
+ * sincronizar, porque nao conseguem achar a obra pai.
+ */
+export async function updateServicosObraId(oldObraId: string, newObraId: string): Promise<number> {
+  if (!oldObraId || !newObraId || oldObraId === newObraId) return 0;
+  try {
+    const oldKey = `${LOCAL_SERVICOS_KEY}:${oldObraId}`;
+    const newKey = `${LOCAL_SERVICOS_KEY}:${newObraId}`;
+    const [[, oldRaw], [, newRaw], [, idsRaw], [, mapRaw]] = await AsyncStorage.multiGet([
+      oldKey,
+      newKey,
+      SERVICOS_OBRA_IDS_KEY,
+      PENDING_SERVICOS_MAP_KEY,
+    ]);
+
+    const antigos: ServicoLocal[] = oldRaw ? JSON.parse(oldRaw) : [];
+    if (antigos.length === 0) return 0;
+
+    const atuais: ServicoLocal[] = newRaw ? JSON.parse(newRaw) : [];
+    const porId = new Map<string, ServicoLocal>(atuais.map((s) => [s.id, s]));
+    for (const servico of antigos) {
+      servico.obra_id = newObraId;
+      porId.set(servico.id, pickBestServicoRecord(porId.get(servico.id), servico));
+    }
+
+    // O mapa de pendentes tambem aponta para o obraId antigo.
+    const mapObj: Record<string, string> = mapRaw ? JSON.parse(mapRaw) : {};
+    for (const servico of antigos) {
+      if (mapObj[servico.id] === oldObraId) mapObj[servico.id] = newObraId;
+    }
+
+    const ids: string[] = idsRaw ? JSON.parse(idsRaw) : [];
+    const idsAtualizados = Array.from(new Set(ids.filter((id) => id !== oldObraId).concat(newObraId)));
+
+    await AsyncStorage.multiSet([
+      [newKey, JSON.stringify(Array.from(porId.values()))],
+      [SERVICOS_OBRA_IDS_KEY, JSON.stringify(idsAtualizados)],
+      [PENDING_SERVICOS_MAP_KEY, JSON.stringify(mapObj)],
+    ]);
+    await AsyncStorage.removeItem(oldKey);
+
+    logger.servico(
+      `[updateServicosObraId] ${antigos.length} servico(s) reapontados de ${oldObraId} para ${newObraId}`
+    );
+    return antigos.length;
+  } catch (error) {
+    logger.error('Erro ao reapontar servicos para o novo obraId:', error);
+    return 0;
+  }
+}
+
+/**
  * Salva servico localmente (offline)
  */
 export async function saveServicoLocal(servico: ServicoLocal): Promise<void> {
@@ -685,7 +745,8 @@ async function resolveLocalPhotosToUrls(
         utm_zone: rest.utm_zone ?? resolved.utmZone ?? null,
       };
     }
-    // Upload falhou  manter URI local para o preview continuar funcionando
+    // Upload falhou — manter URI local para o preview continuar funcionando
+    // e para a proxima tentativa de sync.
     return item;
   });
 }
@@ -1452,13 +1513,35 @@ export async function syncServico(servicoLocal: ServicoLocal): Promise<{
 
   try {
     if (!isUuid(servicoLocal.obra_id)) {
-      const localObras = await getLocalObras();
-      const obraLocal = localObras.find((obra: any) =>
-        obra?.id === servicoLocal.obra_id || obra?.serverId === servicoLocal.obra_id
-      ) as any;
-      const remoteObraId = typeof obraLocal?.serverId === 'string' && isUuid(obraLocal.serverId)
-        ? obraLocal.serverId
-        : null;
+      const buscarObraLocal = async () => {
+        const localObras = await getLocalObras();
+        return localObras.find((obra: any) =>
+          obra?.id === servicoLocal.obra_id || obra?.serverId === servicoLocal.obra_id
+        ) as any;
+      };
+      const extrairRemoteId = (obra: any) =>
+        typeof obra?.serverId === 'string' && isUuid(obra.serverId) ? obra.serverId : null;
+
+      let obraLocal = await buscarObraLocal();
+      let remoteObraId = extrairRemoteId(obraLocal);
+
+      // A obra ainda nao existe no servidor. Em vez de adiar e depender de outro
+      // ciclo — que pode nunca vir, se o app for fechado —, sincroniza a obra aqui
+      // mesmo. Assim o servico deixa de depender da ordem em que as rotinas de sync
+      // sao chamadas, que varia conforme a tela que dispara.
+      if (!remoteObraId && obraLocal?.id) {
+        logger.servico(
+          `[syncServico] Obra ${obraLocal.id} ainda sem UUID remoto — sincronizando a obra antes do servico`
+        );
+        try {
+          const { syncLocalObra } = await import('./offline-sync');
+          await syncLocalObra(obraLocal.id);
+          obraLocal = await buscarObraLocal();
+          remoteObraId = extrairRemoteId(obraLocal);
+        } catch (erroObra) {
+          logger.warn('[syncServico] Falha ao sincronizar a obra antes do servico:', erroObra);
+        }
+      }
 
       if (!remoteObraId) {
         const message = `Obra local ainda sem UUID remoto (obraId: ${servicoLocal.obra_id}). Servico sera sincronizado apos a obra.`;
@@ -1522,9 +1605,15 @@ export async function syncServico(servicoLocal: ServicoLocal): Promise<{
         lostPhotoCount += countUnresolved(poste?.fotos_medicao ?? []);
       }
     }
-    const lostPhotosMessage = lostPhotoCount > 0
-      ? `${lostPhotoCount} foto${lostPhotoCount > 1 ? 's' : ''} não encontrada${lostPhotoCount > 1 ? 's' : ''} no dispositivo — tire novamente`
-      : null;
+    // Foto sem URL nem sempre e foto perdida: sem rede, ou com rede lenta, o envio
+    // apenas foi adiado e o arquivo continua intacto. Mandar "tire novamente" nesse
+    // caso faria a equipe refazer trabalho por causa de sinal ruim.
+    const qualidadeConexao = await getConnectionQuality();
+    const lostPhotosMessage = lostPhotoCount === 0
+      ? null
+      : qualidadeConexao === 'boa'
+        ? `${lostPhotoCount} foto${lostPhotoCount > 1 ? 's' : ''} não encontrada${lostPhotoCount > 1 ? 's' : ''} no dispositivo — tire novamente`
+        : `${lostPhotoCount} foto${lostPhotoCount > 1 ? 's' : ''} aguardando conexão — serão enviadas automaticamente`;
     if (lostPhotosMessage) {
       logger.warn(`[syncServico] ${lostPhotosMessage} (servico ${servicoLocal.id})`);
     }
@@ -2050,13 +2139,25 @@ export async function syncAllPendingServicos(): Promise<{ success: number; faile
 
         for (const servico of servicos) {
           if (servico.sync_status !== 'synced') continue;
-          // Don't re-queue if error_message already set — photos are lost, user must retake
-          if ((servico as any).error_message) continue;
+          // Um error_message ("foto nao encontrada") NAO descarta o servico para sempre:
+          // o arquivo pode continuar no dispositivo, e nesse caso o upload ainda e possivel.
+          // A decisao passou para depois da varredura, onde checamos o arquivo de verdade.
+          const pendingPhotoIds = new Set<string>();
           const hasLocalUri = (item: any): boolean => {
-            if (!item || typeof item !== 'object') return false;
+            if (!item) return false;
+            // Formato legado: a foto e gravada como string (photoId ou uri local).
+            // Se nao for http, ela ainda nao subiu — era o caso que escapava daqui.
+            if (typeof item === 'string') {
+              if (item.startsWith('http')) return false;
+              pendingPhotoIds.add(item.replace(/^file:\/\//, ''));
+              return true;
+            }
+            if (typeof item !== 'object') return false;
             const url = item.url ?? item.supabaseUrl ?? item.uploadUrl;
             if (url && String(url).startsWith('http')) return false;
-            return !!(item.uri || item.id);
+            const pending = !!(item.uri || item.id);
+            if (pending && item.id) pendingPhotoIds.add(String(item.id));
+            return pending;
           };
           const hasPendingUri = (() => {
             // Verifica campos fotos_* e doc_* de nível raiz
@@ -2087,15 +2188,35 @@ export async function syncAllPendingServicos(): Promise<{ success: number; faile
             return false;
           })();
 
-          if (hasPendingUri) {
-            servico.sync_status = 'offline';
-            servico.error_message = null;
-            changed = true;
-            if (!pendingSet.has(servico.id)) {
-              pendingSet.add(servico.id);
-              pendingMapObj[servico.id] = servico.obra_id;
-              requeueCount++;
+          if (!hasPendingUri) continue;
+
+          // So volta para a fila se algum arquivo ainda existir no dispositivo.
+          // A checagem vale SEMPRE, nao apenas quando ha error_message: como o
+          // reenfileiramento limpa a mensagem, condiciona-la ao erro faria o
+          // servico ser reenfileirado a cada ciclo, para sempre, por causa de uma
+          // referencia morta que nenhum upload pode resolver.
+          let algumArquivoExiste = false;
+          for (const photoId of pendingPhotoIds) {
+            if (await photoExists(photoId)) { algumArquivoExiste = true; break; }
+          }
+          if (!algumArquivoExiste) {
+            if (!servicosSemArquivoReportados.has(servico.id)) {
+              servicosSemArquivoReportados.add(servico.id);
+              logger.servico(
+                `[syncAllPendingServicos] Servico ${servico.id} mantido fora da fila: nenhum arquivo local para reenviar`
+              );
             }
+            continue;
+          }
+          servicosSemArquivoReportados.delete(servico.id);
+
+          servico.sync_status = 'offline';
+          servico.error_message = null;
+          changed = true;
+          if (!pendingSet.has(servico.id)) {
+            pendingSet.add(servico.id);
+            pendingMapObj[servico.id] = servico.obra_id;
+            requeueCount++;
           }
         }
 

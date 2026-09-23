@@ -8,7 +8,7 @@ import NetInfo from '@react-native-community/netinfo';
 import { checkInternetConnection, getPendingObras, startAutoSync, syncAllPendingObras, getLocalObras, saveLocalObras, syncAllPendingObrasWithProgress, removePendingObra, removeLocalObra, syncObra, type CancellationToken } from '../../lib/offline-sync';
 import type { PendingObra, LocalObra } from '../../lib/offline-sync';
 import { getQueueStats, retryFailedUploads, processObraPhotos } from '../../lib/photo-queue';
-import { backupPhoto, getPhotoMetadatasByIds } from '../../lib/photo-backup';
+import { backupPhoto, getPhotoMetadatasByIds, getPendingPhotos } from '../../lib/photo-backup';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { SyncProgressModal, type ObraSyncProgress } from '../../components/SyncProgressModal';
 import { ObraContainer, ServiceCard, ServiceTypeSelector } from '../../components/ServicosComponents';
@@ -81,6 +81,9 @@ export default function Obras() {
   const [pendingObrasState, setPendingObrasState] = useState<PendingObra[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // Fotos ainda nao enviadas, por obraId. Permite ver de relance, na lista, quais
+  // obras tem foto guardada no aparelho — sem abrir uma por uma.
+  const [fotosPendentesPorObra, setFotosPendentesPorObra] = useState<Record<string, number>>({});
   const [isOnline, setIsOnline] = useState(true);
   const [syncingPending, setSyncingPending] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -689,6 +692,33 @@ export default function Obras() {
     useCallback(() => {
       reloadAllObras();
     }, [isOnline, equipeLogada, userRole])
+  );
+
+  // Agrupa as fotos pendentes por obra para alimentar o selo de cada card.
+  useFocusEffect(
+    useCallback(() => {
+      let ativo = true;
+      const contar = async () => {
+        try {
+          const pendentes = await getPendingPhotos();
+          if (!ativo) return;
+          const porObra: Record<string, number> = {};
+          for (const foto of pendentes) {
+            if (!foto.obraId) continue;
+            porObra[foto.obraId] = (porObra[foto.obraId] || 0) + 1;
+          }
+          setFotosPendentesPorObra(porObra);
+        } catch {
+          // Selo e informativo: nao pode derrubar a lista de obras.
+        }
+      };
+      contar();
+      const timer = setInterval(contar, 20000);
+      return () => {
+        ativo = false;
+        clearInterval(timer);
+      };
+    }, [])
   );
 
   const onRefresh = () => {
@@ -1361,6 +1391,24 @@ export default function Obras() {
           onAddService={() => handleOpenObraBooksPage(grupo)}
         />
         {renderStatusBadge(obra)}
+        {(() => {
+          // Soma as fotos pendentes de todos os ids desta obra (local e do servidor).
+          const idsDaObra = new Set<string>();
+          grupo.itens.forEach((item: any) => {
+            if (item?.id) idsDaObra.add(item.id);
+            if (item?.serverId) idsDaObra.add(item.serverId);
+          });
+          let pendentes = 0;
+          idsDaObra.forEach((id) => { pendentes += fotosPendentesPorObra[id] || 0; });
+          if (pendentes === 0) return null;
+          return (
+            <View style={styles.fotosPendentesBadge}>
+              <Text style={styles.fotosPendentesTexto}>
+                ☁️ {pendentes} foto{pendentes > 1 ? 's' : ''} aguardando envio
+              </Text>
+            </View>
+          );
+        })()}
         {obra.origem === 'offline' && !obra.serverId && (
           <View style={styles.cardFooter}>
             <TouchableOpacity style={styles.syncObraButton} onPress={() => handleSyncSingleObra(obra)}>
@@ -1370,7 +1418,7 @@ export default function Obras() {
         )}
       </View>
     );
-  }, [servicosPorObra, handleOpenObraBooksPage, handleSyncSingleObra, handleDeleteObra, renderStatusBadge, toSyncStatusServico, formatarData]);
+  }, [servicosPorObra, fotosPendentesPorObra, handleOpenObraBooksPage, handleSyncSingleObra, handleDeleteObra, renderStatusBadge, toSyncStatusServico, formatarData]);
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
@@ -1606,6 +1654,22 @@ const styles = StyleSheet.create({
   },
   obraGroupItem: {
     marginBottom: 12,
+  },
+  fotosPendentesBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: 6,
+    marginTop: 6,
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: '#FEF3C7',
+  },
+  fotosPendentesTexto: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#92400E',
   },
   loadMoreButton: {
     backgroundColor: '#fff',
