@@ -5,14 +5,9 @@ import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter, useFocusEffect } from 'expo-router';
 import NetInfo from '@react-native-community/netinfo';
 import type { PendingObra } from '../lib/offline-sync';
-<<<<<<< HEAD
-import { getLocalObraById, forceUpdateObraFromSupabase, syncLocalObra, checkInternetConnection } from '../lib/offline-sync';
+import { getLocalObraById, forceUpdateObraFromSupabase, syncLocalObra, checkInternetConnection, updateLocalObraFields } from '../lib/offline-sync';
 import { getPhotosByObraWithFallback, getPendingPhotos, type PhotoMetadata } from '../lib/photo-backup';
 import { getConnectionQuality, type ConnectionQuality } from '../lib/photo-queue';
-=======
-import { getLocalObraById, forceUpdateObraFromSupabase, syncLocalObra, checkInternetConnection, updateLocalObraFields } from '../lib/offline-sync';
-import { getPhotosByObraWithFallback, type PhotoMetadata } from '../lib/photo-backup';
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
 import { supabase } from '../lib/supabase';
 
 type FotoInfo = {
