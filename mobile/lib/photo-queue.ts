@@ -8,7 +8,8 @@ import {
   markPhotoAsLost,
   incrementPhotoRetries,
   deletePhotoBackup,
-  photoExists,
+  photoExistsStrict,
+  archiveUploadedPhotos,
   updatePhotoPaths
 } from './photo-backup';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -103,8 +104,10 @@ async function readQueueRaw(): Promise<UploadQueueItem[]> {
       const keys = Array.from({ length: n }, (_, i) => `${UPLOAD_QUEUE_CHUNK_KEY}${i}`);
       const pairs = await AsyncStorage.multiGet(keys);
       const all: UploadQueueItem[] = [];
-      for (const [, chunk] of pairs) {
-        if (chunk) all.push(...(JSON.parse(chunk) as UploadQueueItem[]));
+      for (const [chunkKey, chunk] of pairs) {
+        // Chunk ausente: não devolver fila parcial, pois o próximo write a sobrescreveria.
+        if (chunk == null) throw new Error(`Fila de upload incompleta: chunk ausente (${chunkKey}) de ${n}`);
+        all.push(...(JSON.parse(chunk) as UploadQueueItem[]));
       }
       return all;
     }
@@ -118,12 +121,13 @@ async function writeQueueRaw(queue: UploadQueueItem[]): Promise<void> {
   const json = JSON.stringify(queue);
   if (json.length <= QUEUE_CHUNK_MAX_BYTES) {
     const nRaw = await AsyncStorage.getItem(UPLOAD_QUEUE_CHUNK_COUNT);
+    // Grava a chave nova ANTES de remover os chunks: morrer entre os passos não perde a fila.
+    await AsyncStorage.setItem(UPLOAD_QUEUE_KEY, json);
     if (nRaw) {
       const oldN = parseInt(nRaw, 10);
       const toRemove = [UPLOAD_QUEUE_CHUNK_COUNT, ...Array.from({ length: oldN }, (_, i) => `${UPLOAD_QUEUE_CHUNK_KEY}${i}`)];
       await AsyncStorage.multiRemove(toRemove);
     }
-    await AsyncStorage.setItem(UPLOAD_QUEUE_KEY, json);
     return;
   }
   const chunks: UploadQueueItem[][] = [[]];
@@ -147,6 +151,21 @@ async function writeQueueRaw(queue: UploadQueueItem[]): Promise<void> {
   const toRemove = [UPLOAD_QUEUE_KEY, ...Array.from({ length: Math.max(0, oldN - chunks.length) }, (_, i) => `${UPLOAD_QUEUE_CHUNK_KEY}${chunks.length + i}`)];
   await AsyncStorage.multiRemove(toRemove);
 }
+
+/**
+ * Mutex em memória da fila: cada mutação é read-modify-write da fila inteira, e o upload
+ * roda 2 fotos em paralelo com várias escritas por foto. Sem serializar, uma escrita
+ * atrasada desfaz a outra (item enviado volta para a fila, status fica errado).
+ * Mesmo padrão do runExclusiveMetadata em photo-backup.ts. Não é reentrante: nenhuma
+ * função travada pode chamar outra travada.
+ */
+let queueMutex: Promise<void> = Promise.resolve();
+
+const runExclusiveQueue = <T>(task: () => Promise<T>): Promise<T> => {
+  const result = queueMutex.then(task);
+  queueMutex = result.then(() => undefined, () => undefined);
+  return result;
+};
 
 const NETWORK_ERROR_PATTERNS = [
   'unable to resolve host',
@@ -289,21 +308,24 @@ const healPhotoMetadataPaths = async (photoMetadata: PhotoMetadata, resolvedUri:
  */
 export const addToUploadQueue = async (photoId: string, obraId: string): Promise<void> => {
   try {
-    const queue = await getUploadQueue();
+    await runExclusiveQueue(async () => {
+      // readQueueRaw (e não getUploadQueue): se a leitura falhar, não regravar a fila como vazia.
+      const queue = await readQueueRaw();
 
-    // Verificar se já existe
-    const exists = queue.find(item => item.photoId === photoId);
-    if (exists) return;
+      // Verificar se já existe
+      const exists = queue.find(item => item.photoId === photoId);
+      if (exists) return;
 
-    const newItem: UploadQueueItem = {
-      photoId,
-      obraId,
-      status: 'pending',
-      addedAt: new Date().toISOString()
-    };
+      const newItem: UploadQueueItem = {
+        photoId,
+        obraId,
+        status: 'pending',
+        addedAt: new Date().toISOString()
+      };
 
-    queue.push(newItem);
-    await writeQueueRaw(queue);
+      queue.push(newItem);
+      await writeQueueRaw(queue);
+    });
   } catch (error) {
     logger.error('Erro ao adicionar foto à fila:', error);
     throw error;
@@ -322,7 +344,10 @@ export const getUploadQueue = async (): Promise<UploadQueueItem[]> => {
   }
 };
 
-const normalizeQueueState = async (queue: UploadQueueItem[]): Promise<UploadQueueItem[]> => {
+const normalizeQueueState = (): Promise<UploadQueueItem[]> =>
+  runExclusiveQueue(async () => {
+  // Relê dentro do mutex: uma fila lida antes de entrar aqui pode já estar velha.
+  const queue = await readQueueRaw();
   if (queue.length === 0) return queue;
 
   const now = Date.now();
@@ -371,7 +396,7 @@ const normalizeQueueState = async (queue: UploadQueueItem[]): Promise<UploadQueu
   }
 
   return normalized;
-};
+  });
 
 /**
  * Atualiza status de um item na fila
@@ -382,20 +407,22 @@ const updateQueueItemStatus = async (
   error?: string
 ): Promise<void> => {
   try {
-    const queue = await getUploadQueue();
-    const item = queue.find(i => i.photoId === photoId);
+    await runExclusiveQueue(async () => {
+      const queue = await readQueueRaw();
+      const item = queue.find(i => i.photoId === photoId);
 
-    if (item) {
-      item.status = status;
-      item.lastAttemptAt = new Date().toISOString();
-      if (error) {
-        item.error = error;
-      } else {
-        delete item.error;
+      if (item) {
+        item.status = status;
+        item.lastAttemptAt = new Date().toISOString();
+        if (error) {
+          item.error = error;
+        } else {
+          delete item.error;
+        }
+
+        await writeQueueRaw(queue);
       }
-
-      await writeQueueRaw(queue);
-    }
+    });
   } catch (error) {
     logger.error('Erro ao atualizar status na fila:', error);
   }
@@ -406,9 +433,11 @@ const updateQueueItemStatus = async (
  */
 const removeFromQueue = async (photoId: string): Promise<void> => {
   try {
-    const queue = await getUploadQueue();
-    const filtered = queue.filter(item => item.photoId !== photoId);
-    await writeQueueRaw(filtered);
+    await runExclusiveQueue(async () => {
+      const queue = await readQueueRaw();
+      const filtered = queue.filter(item => item.photoId !== photoId);
+      await writeQueueRaw(filtered);
+    });
   } catch (error) {
     logger.error('Erro ao remover da fila:', error);
   }
@@ -425,7 +454,7 @@ const uploadPhotoToSupabase = async (
     const folderName = photoMetadata.obraId || 'temp';
 
     // Verificar se foto existe
-    const exists = await photoExists(photoMetadata.id);
+    const exists = await photoExistsStrict(photoMetadata.id);
     if (!exists) {
       logger.warn(`[uploadPhotoToSupabase] Foto ${photoMetadata.id} nao encontrada no photo-backup`);
       return { success: false, error: 'Foto nao encontrada no photo-backup', skipRetry: true };
@@ -688,8 +717,7 @@ export const processUploadQueue = async (
   onProgress?: (progress: UploadProgress) => void
 ): Promise<{ success: number; failed: number; results: UploadResult[] }> => {
   try {
-    const queue = await getUploadQueue();
-    await normalizeQueueState(queue);
+    await normalizeQueueState();
 
     const pendingPhotos = await getPendingPhotos();
 
@@ -754,6 +782,9 @@ export const processUploadQueue = async (
       });
     }
 
+    // Uma única escrita move todas as enviadas para o arquivo (ver markPhotoAsUploaded).
+    await archiveUploadedPhotos();
+
     return { success: successCount, failed: failedCount, results };
 
   } catch (error) {
@@ -772,8 +803,7 @@ export const processObraPhotos = async (
   photoIds?: string[]
 ): Promise<{ success: number; failed: number; results: UploadResult[] }> => {
   try {
-    const queue = await getUploadQueue();
-    await normalizeQueueState(queue);
+    await normalizeQueueState();
 
     const allPending = await getPendingPhotos();
     const uniquePhotoIds = photoIds && photoIds.length > 0 ? Array.from(new Set(photoIds)) : null;
@@ -858,6 +888,9 @@ export const processObraPhotos = async (
 
     logger.photos(`[processObraPhotos] ✅ Concluído: ${successCount} sucesso, ${failedCount} falhas`);
 
+    // Uma única escrita move todas as enviadas para o arquivo (ver markPhotoAsUploaded).
+    await archiveUploadedPhotos();
+
     return { success: successCount, failed: failedCount, results };
 
   } catch (error) {
@@ -877,8 +910,7 @@ export const getQueueStats = async (): Promise<{
   failed: number;
 }> => {
   try {
-    const queue = await getUploadQueue();
-    const normalizedQueue = await normalizeQueueState(queue);
+    const normalizedQueue = await normalizeQueueState();
 
     return {
       total: normalizedQueue.length,
@@ -919,8 +951,7 @@ export const retryFailedUploads = async (
   onProgress?: (progress: UploadProgress) => void
 ): Promise<{ success: number; failed: number }> => {
   try {
-    const queue = await getUploadQueue();
-    const normalizedQueue = await normalizeQueueState(queue);
+    const normalizedQueue = await normalizeQueueState();
     const failed = normalizedQueue.filter(i => i.status === 'failed');
 
     if (failed.length === 0) {

@@ -284,6 +284,11 @@ function PosteCardComponent({
 
 const PosteCard = memo(PosteCardComponent);
 
+// Permissões já concedidas nesta sessão. Pedir de novo a cada foto custa 2 idas ao módulo
+// nativo antes de a câmera abrir; depois do primeiro "granted" não muda até o app reiniciar
+// (se o usuário revogar nas configurações, o Android reinicia o processo).
+const grantedPermissionsCache = new Set<string>();
+
 export default function NovaObra() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -2036,6 +2041,9 @@ export default function NovaObra() {
     source: 'camera' | 'gallery',
     needsLocation: boolean
   ) => {
+    const cacheKey = `${source}:${needsLocation ? 'loc' : 'noloc'}`;
+    if (grantedPermissionsCache.has(cacheKey)) return true;
+
     try {
       // PROTEÇÃO: Timeout de 30 segundos para solicitação de permissões
       const mediaPermissionPromise = source === 'camera'
@@ -2071,10 +2079,11 @@ export default function NovaObra() {
           'Permissão de Localização Negada',
           'É necessário permitir o acesso à localização para registrar as coordenadas.\n\nAs fotos serão salvas sem localização GPS.'
         );
-        // Permite continuar sem GPS
+        // Permite continuar sem GPS (não guarda em cache: pergunta de novo na próxima foto)
         return true;
       }
 
+      grantedPermissionsCache.add(cacheKey);
       return true;
     } catch (error: any) {
       // PROTEÇÃO ROBUSTA: Nunca crashar ao solicitar permissões

@@ -10,7 +10,8 @@ import { logger } from '../utils/logger';
 
 const PHOTO_BACKUP_DIR = `${FileSystem.documentDirectory}obra_photos_backup/`;
 const PHOTO_METADATA_KEY = '@photo_metadata';
-// Fotos já enviadas (uploaded=true + supabaseUrl) ficam aqui; só pendentes ficam em PHOTO_METADATA_KEY
+// Fotos já enviadas (uploaded=true + supabaseUrl) ficam aqui; PHOTO_METADATA_KEY guarda as pendentes
+// e as recém-enviadas, que archiveUploadedPhotos move para cá em lote no fim do sync
 const PHOTO_METADATA_ARCHIVED_KEY = '@photo_metadata:archived';
 const ARCHIVED_PRUNED_AT_KEY = '@photo_metadata:archived_pruned_at';
 const ARCHIVED_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1 dia
@@ -18,13 +19,91 @@ const ARCHIVED_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 dias
 const MIN_FREE_STORAGE_BYTES = 80 * 1024 * 1024; // 80MB
 const STORAGE_SAFETY_MARGIN_BYTES = 20 * 1024 * 1024; // 20MB
 
+// Chunked storage para @photo_metadata e @photo_metadata:archived — evita o erro
+// "Row too big" do SQLite Android (limite ~2MB por linha) quando a equipe acumula
+// centenas/milhares de fotos pendentes offline. Sem isso, o write falha e o
+// índice inteiro de fotos pendentes pode se perder de uma vez. Mesmo padrão e
+// mesmo limite já usados na fila de upload (photo-queue.ts).
+const META_CHUNK_MAX_BYTES = 1_400_000; // 1.4MB por chunk, bem abaixo do limite de 2MB
+const metaChunkCountKey = (key: string) => `${key}_n`;
+const metaChunkDataKey = (key: string, i: number) => `${key}_c${i}`;
+
+/** Lê uma chave de metadata independente do formato (chave única legada ou chunks). */
+async function getMetaItem(key: string): Promise<string | null> {
+  const nRaw = await AsyncStorage.getItem(metaChunkCountKey(key));
+  if (nRaw) {
+    const n = parseInt(nRaw, 10);
+    if (n > 0) {
+      const keys = Array.from({ length: n }, (_, i) => metaChunkDataKey(key, i));
+      const pairs = await AsyncStorage.multiGet(keys);
+      let joined = '';
+      for (const [chunkKey, chunk] of pairs) {
+        // Chunk ausente = leitura inconsistente ou dado corrompido. Juntar o que sobrou
+        // produziria JSON truncado; é melhor falhar alto do que devolver lista vazia.
+        if (chunk == null) {
+          throw new Error(`Metadata incompleto: chunk ausente (${chunkKey}) de ${n}`);
+        }
+        joined += chunk;
+      }
+      return joined || null;
+    }
+  }
+  return AsyncStorage.getItem(key);
+}
+
+/** Escreve uma chave de metadata, dividindo em chunks se ultrapassar o limite seguro. */
+async function setMetaItem(key: string, value: string): Promise<void> {
+  const nRaw = await AsyncStorage.getItem(metaChunkCountKey(key));
+  const oldN = nRaw ? parseInt(nRaw, 10) : 0;
+
+  if (value.length <= META_CHUNK_MAX_BYTES) {
+    // Grava a chave nova ANTES de remover os chunks antigos: se o app morrer entre os
+    // dois passos, o leitor ainda encontra o dado antigo em vez de perder o índice.
+    await AsyncStorage.setItem(key, value);
+    if (oldN > 0) {
+      const toRemove = [metaChunkCountKey(key), ...Array.from({ length: oldN }, (_, i) => metaChunkDataKey(key, i))];
+      await AsyncStorage.multiRemove(toRemove);
+    }
+    return;
+  }
+
+  const chunkCount = Math.ceil(value.length / META_CHUNK_MAX_BYTES);
+  const writes: [string, string][] = [[metaChunkCountKey(key), String(chunkCount)]];
+  for (let i = 0; i < chunkCount; i++) {
+    writes.push([metaChunkDataKey(key, i), value.slice(i * META_CHUNK_MAX_BYTES, (i + 1) * META_CHUNK_MAX_BYTES)]);
+  }
+  await AsyncStorage.multiSet(writes);
+  const toRemove = [key, ...Array.from({ length: Math.max(0, oldN - chunkCount) }, (_, i) => metaChunkDataKey(key, chunkCount + i))];
+  await AsyncStorage.multiRemove(toRemove);
+}
+
+/** Lê e parseia um array de metadata (vazio se a chave não existe). */
+async function readMetaArray(key: string): Promise<PhotoMetadata[]> {
+  const raw = await getMetaItem(key);
+  return raw ? (JSON.parse(raw) as PhotoMetadata[]) : [];
+}
+
+/** multiGet ciente de chunking — substituto direto de AsyncStorage.multiGet para chaves de metadata. */
+async function multiGetMeta(keys: string[]): Promise<[string, string | null][]> {
+  const values = await Promise.all(keys.map((k) => getMetaItem(k)));
+  return keys.map((k, i) => [k, values[i]] as [string, string | null]);
+}
+
+/** multiSet ciente de chunking — substituto direto de AsyncStorage.multiSet para chaves de metadata. */
+async function multiSetMeta(pairs: [string, string][]): Promise<void> {
+  await Promise.all(pairs.map(([k, v]) => setMetaItem(k, v)));
+}
+
 /**
  * Verifica espaço livre antes de copiar/comprimir arquivos para reduzir risco de falha por disco cheio.
  */
-const ensureEnoughStorageForBackup = async (uri: string): Promise<void> => {
+const ensureEnoughStorageForBackup = async (uri: string, knownSize?: number): Promise<void> => {
   try {
-    const fileInfo = await FileSystem.getInfoAsync(uri);
-    const originalSize = fileInfo.exists ? (fileInfo.size || 0) : 0;
+    let originalSize = knownSize;
+    if (originalSize === undefined) {
+      const fileInfo = await FileSystem.getInfoAsync(uri);
+      originalSize = fileInfo.exists ? (fileInfo.size || 0) : 0;
+    }
     const estimatedRequiredBytes = Math.max(
       MIN_FREE_STORAGE_BYTES,
       (originalSize * 2) + STORAGE_SAFETY_MARGIN_BYTES
@@ -107,12 +186,17 @@ export interface PhotoMetadata {
 /**
  * Garante que o diretório de backup existe
  */
+let backupDirReady = false;
+
 const ensureBackupDirectoryExists = async (): Promise<void> => {
+  // Depois de confirmada uma vez, não pergunta ao disco a cada captura.
+  if (backupDirReady) return;
   const dirInfo = await FileSystem.getInfoAsync(PHOTO_BACKUP_DIR);
 
   if (!dirInfo.exists) {
     await FileSystem.makeDirectoryAsync(PHOTO_BACKUP_DIR, { intermediates: true });
   }
+  backupDirReady = true;
 };
 
 /**
@@ -205,8 +289,15 @@ export const backupPhoto = async (
   let metadataSaved = false;
 
   try {
-    await ensureEnoughStorageForBackup(uri);
-    await ensureBackupDirectoryExists();
+    const sourceInfo = await FileSystem.getInfoAsync(uri);
+    if (!sourceInfo.exists) {
+      throw new Error('Arquivo de origem nao encontrado para backup');
+    }
+    const sourceSize = (sourceInfo as any).size ?? 0;
+    await Promise.all([
+      ensureEnoughStorageForBackup(uri, sourceSize),
+      ensureBackupDirectoryExists(),
+    ]);
 
     const isPdf = mimeType === 'application/pdf';
     const ext = isPdf ? 'pdf' : 'jpg';
@@ -216,11 +307,6 @@ export const backupPhoto = async (
     const compressedFilename = `${photoId}_compressed.${ext}`;
     compressedPath = `${PHOTO_BACKUP_DIR}${compressedFilename}`;
 
-    const sourceInfo = await FileSystem.getInfoAsync(uri);
-    if (!sourceInfo.exists) {
-      throw new Error('Arquivo de origem nao encontrado para backup');
-    }
-    const sourceSize = (sourceInfo as any).size ?? 0;
     const MIN_VALID_SIZE = isPdf ? 512 : 1024;
     if (sourceSize < MIN_VALID_SIZE) {
       throw new Error(`Arquivo de origem invalido: ${sourceSize} bytes (minimo: ${MIN_VALID_SIZE}B)`);
@@ -250,42 +336,35 @@ export const backupPhoto = async (
     await savePhotoMetadata(metadata);
     metadataSaved = true;
 
-    // 2. Copiar arquivo original para backup
-    await FileSystem.copyAsync({
-      from: uri,
-      to: backupPath
-    });
+    // 2 e 3. Copiar o original para backup e gerar a versão comprimida ao mesmo tempo:
+    // a compressão (a parte lenta) não espera mais a cópia terminar.
+    const copyOriginalPromise = FileSystem.copyAsync({ from: uri, to: backupPath });
+    const compressPromise: Promise<string> = isPdf
+      ? Promise.resolve(uri) // PDFs sao copiados sem compressao
+      : compressPhoto(uri).catch((error) => {
+          logger.warn('Compressão falhou, usando arquivo original:', error);
+          return uri;
+        });
 
-    // 3. Criar versão comprimida (apenas para imagens; PDFs sao copiados sem compressao)
-    let compressedUri = uri;
-    if (!isPdf) {
+    const [, compressedUri] = await Promise.all([copyOriginalPromise, compressPromise]);
+
+    // O resultado da compressão já é um arquivo novo no cache: mover é instantâneo,
+    // copiar de novo duplicaria os bytes. Só copia quando não houve compressão (original/PDF).
+    if (compressedUri !== uri) {
       try {
-        compressedUri = await compressPhoto(uri);
-
-        // ✅ Verificar se a compressão gerou um arquivo válido
-        const compressedInfo = await FileSystem.getInfoAsync(compressedUri);
-        if (!compressedInfo.exists) {
-          logger.warn('Arquivo comprimido não existe, usando original');
-          compressedUri = uri;
+        await FileSystem.moveAsync({ from: compressedUri, to: compressedPath });
+      } catch (moveError) {
+        logger.warn('Falha ao mover arquivo comprimido, tentando copiar:', moveError);
+        try {
+          await FileSystem.copyAsync({ from: compressedUri, to: compressedPath });
+        } catch (copyError) {
+          logger.warn('Falha ao copiar arquivo comprimido, usando backup original:', copyError);
+          await FileSystem.copyAsync({ from: backupPath, to: compressedPath });
         }
-      } catch (error) {
-        logger.warn('Compressão falhou, usando arquivo original:', error);
       }
-    }
-
-    // ✅ Tentar copiar arquivo comprimido (ou original para PDFs)
-    try {
-      await FileSystem.copyAsync({
-        from: compressedUri,
-        to: compressedPath
-      });
-    } catch (copyError) {
-      // Se falhar, tentar usar o backup original
-      logger.warn('Falha ao copiar arquivo comprimido, tentando usar backup original:', copyError);
-      await FileSystem.copyAsync({
-        from: backupPath,
-        to: compressedPath
-      });
+    } else {
+      // Sem compressão: o backup recém-copiado já é o conteúdo final.
+      await FileSystem.copyAsync({ from: backupPath, to: compressedPath });
     }
 
     // ✅ Verificar se o arquivo foi salvo corretamente
@@ -371,7 +450,7 @@ const runExclusiveMetadata = <T>(task: () => Promise<T>): Promise<T> => {
 const savePhotoMetadata = (metadata: PhotoMetadata): Promise<void> =>
   runExclusiveMetadata(async () => {
     try {
-      const raw = await AsyncStorage.getItem(PHOTO_METADATA_KEY);
+      const raw = await getMetaItem(PHOTO_METADATA_KEY);
       const allMetadata: PhotoMetadata[] = raw ? JSON.parse(raw) : [];
       const index = allMetadata.findIndex(m => m.id === metadata.id);
       if (index !== -1) {
@@ -379,7 +458,7 @@ const savePhotoMetadata = (metadata: PhotoMetadata): Promise<void> =>
       } else {
         allMetadata.push(metadata);
       }
-      await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(allMetadata));
+      await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(allMetadata));
     } catch (error) {
       logger.error('Erro ao salvar metadata da foto:', error);
       throw error;
@@ -389,14 +468,14 @@ const savePhotoMetadata = (metadata: PhotoMetadata): Promise<void> =>
 const removePhotoMetadata = (photoId: string): Promise<void> =>
   runExclusiveMetadata(async () => {
     try {
-      const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+      const results = await multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
       const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
       const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
       const nextActive = active.filter((m) => m.id !== photoId);
       const nextArchived = archived.filter((m) => m.id !== photoId);
 
-      await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(nextActive));
-      await AsyncStorage.setItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(nextArchived));
+      await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(nextActive));
+      await setMetaItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(nextArchived));
     } catch (error) {
       logger.warn('[removePhotoMetadata] Falha ao remover metadata durante rollback:', error);
     }
@@ -406,12 +485,19 @@ const removePhotoMetadata = (photoId: string): Promise<void> =>
  * Obtém todas as metadatas de fotos (ativas + arquivadas).
  * Para operações de sync que precisam de fotos já enviadas.
  */
-export const getAllPhotoMetadata = async (): Promise<PhotoMetadata[]> => {
-  try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+const readAllPhotoMetadataStrict = (): Promise<PhotoMetadata[]> =>
+  // Sob o mutex: sem isso, uma leitura no meio de uma escrita em chunks vê chunks de
+  // gerações diferentes e o JSON.parse falha.
+  runExclusiveMetadata(async () => {
+    const results = await multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
     const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
     const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
     return [...active, ...archived];
+  });
+
+export const getAllPhotoMetadata = async (): Promise<PhotoMetadata[]> => {
+  try {
+    return await readAllPhotoMetadataStrict();
   } catch (error) {
     logger.error('Erro ao obter metadata das fotos:', error);
     return [];
@@ -423,15 +509,15 @@ export const getAllPhotoMetadata = async (): Promise<PhotoMetadata[]> => {
  * Só executa se a última poda foi há mais de ARCHIVED_PRUNE_INTERVAL_MS.
  * Retorna o número de entradas removidas (0 se pulou ou não havia nada).
  */
-export const pruneArchivedPhotoMetadata = async (): Promise<number> => {
+const pruneArchivedPhotoMetadataUnlocked = async (): Promise<number> => {
   try {
-    const lastPrunedRaw = await AsyncStorage.getItem(ARCHIVED_PRUNED_AT_KEY);
+    const lastPrunedRaw = await getMetaItem(ARCHIVED_PRUNED_AT_KEY);
     const lastPruned = lastPrunedRaw ? Number(lastPrunedRaw) : 0;
     if (Date.now() - lastPruned < ARCHIVED_PRUNE_INTERVAL_MS) return 0;
 
-    const raw = await AsyncStorage.getItem(PHOTO_METADATA_ARCHIVED_KEY);
+    const raw = await getMetaItem(PHOTO_METADATA_ARCHIVED_KEY);
     if (!raw) {
-      await AsyncStorage.setItem(ARCHIVED_PRUNED_AT_KEY, String(Date.now()));
+      await setMetaItem(ARCHIVED_PRUNED_AT_KEY, String(Date.now()));
       return 0;
     }
 
@@ -443,7 +529,7 @@ export const pruneArchivedPhotoMetadata = async (): Promise<number> => {
     });
 
     const removed = archived.length - kept.length;
-    await AsyncStorage.multiSet([
+    await multiSetMeta([
       [PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(kept)],
       [ARCHIVED_PRUNED_AT_KEY, String(Date.now())],
     ]);
@@ -465,7 +551,7 @@ export const pruneArchivedPhotoMetadata = async (): Promise<number> => {
  */
 export const getPendingPhotos = async (): Promise<PhotoMetadata[]> => {
   try {
-    const raw = await AsyncStorage.getItem(PHOTO_METADATA_KEY);
+    const raw = await runExclusiveMetadata(() => getMetaItem(PHOTO_METADATA_KEY));
     const active: PhotoMetadata[] = raw ? JSON.parse(raw) : [];
     return active.filter(m => {
       if (m.lost) return false;
@@ -502,9 +588,9 @@ export const getZombiePhotos = async (obraId?: string): Promise<PhotoMetadata[]>
 /**
  * Reseta fotos zombie para permitir novo upload
  */
-export const resetZombiePhotos = async (obraId?: string): Promise<number> => {
+const resetZombiePhotosUnlocked = async (obraId?: string): Promise<number> => {
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+    const results = await multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
     const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
     const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
     let count = 0;
@@ -524,7 +610,7 @@ export const resetZombiePhotos = async (obraId?: string): Promise<number> => {
     const nextArchived = archived.map(resetIfZombie);
 
     if (count > 0) {
-      await AsyncStorage.multiSet([
+      await multiSetMeta([
         [PHOTO_METADATA_KEY, JSON.stringify(nextActive)],
         [PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(nextArchived)],
       ]);
@@ -629,7 +715,7 @@ export const getPhotoMetadatasByIds = async (photoIds: string[]): Promise<PhotoM
   const results: PhotoMetadata[] = [];
 
   try {
-    const pairs = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+    const pairs = await runExclusiveMetadata(() => multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]));
     const activeRaw = pairs[0][1];
     const archivedRaw = pairs[1][1];
 
@@ -698,7 +784,7 @@ export const getPhotoMetadataFallbackCandidatesByUri = async (failedUri: string)
   };
 
   try {
-    const pairs = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+    const pairs = await runExclusiveMetadata(() => multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]));
     const active: PhotoMetadata[] = pairs[0][1] ? JSON.parse(pairs[0][1]) : [];
     const activeCandidates = findCandidate(active);
     if (activeCandidates.length > 0) return activeCandidates;
@@ -715,32 +801,27 @@ export const getPhotoMetadataFallbackCandidatesByUri = async (failedUri: string)
  * Marca uma foto como uploaded, salva a URL do Supabase e move da chave ativa para archived.
  * Isso mantém a chave ativa pequena (só pendentes), acelerando getPendingPhotos.
  */
-export const markPhotoAsUploaded = async (photoId: string, uploadUrl: string): Promise<void> => {
+const markPhotoAsUploadedUnlocked = async (photoId: string, uploadUrl: string): Promise<void> => {
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
-    const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
-    const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
+    const active = await readMetaArray(PHOTO_METADATA_KEY);
 
     const activeIdx = active.findIndex(m => m.id === photoId);
     if (activeIdx !== -1) {
-      const updated: PhotoMetadata = { ...active[activeIdx], uploaded: true, uploadUrl, supabaseUrl: uploadUrl };
-      const archivedIdx = archived.findIndex((m) => m.id === photoId);
-      const nextArchived = archivedIdx === -1
-        ? [...archived, updated]
-        : archived.map((m, idx) => (idx === archivedIdx ? updated : m));
-      const nextActive = active.filter((m) => m.id !== photoId);
-      await AsyncStorage.multiSet([
-        [PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(nextArchived)],
-        [PHOTO_METADATA_KEY, JSON.stringify(nextActive)],
-      ]);
+      // Marca no lugar, sem tocar no arquivo de enviadas: este write roda uma vez por foto
+      // dentro do mutex, e reescrever dezenas de MB a cada upload travava a captura durante
+      // o sync. getPendingPhotos já ignora foto enviada com URL; a mudança para o arquivo
+      // acontece em lote, no fim do sync (archiveUploadedPhotos).
+      active[activeIdx] = { ...active[activeIdx], uploaded: true, uploadUrl, supabaseUrl: uploadUrl };
+      await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(active));
       return;
     }
 
     // Foto já estava no archived (re-marcação)
+    const archived = await readMetaArray(PHOTO_METADATA_ARCHIVED_KEY);
     const archivedIdx = archived.findIndex(m => m.id === photoId);
     if (archivedIdx !== -1) {
       archived[archivedIdx] = { ...archived[archivedIdx], uploaded: true, uploadUrl, supabaseUrl: uploadUrl };
-      await AsyncStorage.setItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
+      await setMetaItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
     }
   } catch (error) {
     logger.error('Erro ao marcar foto como uploaded:', error);
@@ -749,13 +830,39 @@ export const markPhotoAsUploaded = async (photoId: string, uploadUrl: string): P
 };
 
 /**
+ * Move para o arquivo de enviadas todas as fotos já enviadas (com URL remota) que ainda estão
+ * nas ativas. Uma leitura e uma escrita para o lote inteiro, em vez de uma por foto.
+ */
+const archiveUploadedPhotosUnlocked = async (): Promise<number> => {
+  try {
+    const active = await readMetaArray(PHOTO_METADATA_KEY);
+    const done = active.filter((m) => m.uploaded && !!(m.uploadUrl || m.supabaseUrl));
+    if (done.length === 0) return 0;
+
+    const archived = await readMetaArray(PHOTO_METADATA_ARCHIVED_KEY);
+    const doneIds = new Set(done.map((m) => m.id));
+    // Se o id já existe no arquivo, a versão recém-enviada substitui a antiga.
+    const nextArchived = [...archived.filter((m) => !doneIds.has(m.id)), ...done];
+    const nextActive = active.filter((m) => !doneIds.has(m.id));
+
+    // Arquivo primeiro: se o app morrer entre as duas gravações, a foto fica nos dois
+    // lugares (inofensivo) em vez de em nenhum.
+    await setMetaItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(nextArchived));
+    await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(nextActive));
+    return done.length;
+  } catch (error) {
+    logger.warn('[archiveUploadedPhotos] Falha ao arquivar fotos enviadas (não crítico):', error);
+    return 0;
+  }
+};
+
+/**
  * Marca uma foto como perdida para impedir retries infinitos
  */
-export const markPhotoAsLost = async (photoId: string, reason?: string): Promise<boolean> => {
+const markPhotoAsLostUnlocked = async (photoId: string, reason?: string): Promise<boolean> => {
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
-    const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
-    const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
+    // O arquivo de enviadas pode ter dezenas de MB: só é lido se a foto não estiver nas ativas.
+    const active = await readMetaArray(PHOTO_METADATA_KEY);
 
     const applyLost = (photo: PhotoMetadata) => {
       const hadRemoteUrl = !!(photo.uploadUrl || photo.supabaseUrl);
@@ -774,14 +881,15 @@ export const markPhotoAsLost = async (photoId: string, reason?: string): Promise
     const activeIdx = active.findIndex(m => m.id === photoId);
     if (activeIdx !== -1) {
       applyLost(active[activeIdx]);
-      await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(active));
+      await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(active));
       return true;
     }
 
+    const archived = await readMetaArray(PHOTO_METADATA_ARCHIVED_KEY);
     const archivedIdx = archived.findIndex(m => m.id === photoId);
     if (archivedIdx !== -1) {
       applyLost(archived[archivedIdx]);
-      await AsyncStorage.setItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
+      await setMetaItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
       return true;
     }
 
@@ -799,7 +907,7 @@ export const markPhotoAsLost = async (photoId: string, reason?: string): Promise
  * - Se não existe → cria entrada nova com `uri` como caminho do arquivo.
  * Retorna true se uma nova entrada foi criada ou restaurada.
  */
-export const ensurePhotoMetadataFromUri = async (
+const ensurePhotoMetadataFromUriUnlocked = async (
   photoId: string,
   localUri: string,
   obraId: string,
@@ -808,7 +916,7 @@ export const ensurePhotoMetadataFromUri = async (
 ): Promise<boolean> => {
   if (!photoId || !localUri) return false;
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+    const results = await multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
     const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
     const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
 
@@ -833,7 +941,7 @@ export const ensurePhotoMetadataFromUri = async (
           compressedPath: localUri,
           backupPath: localUri,
         } as PhotoMetadata;
-        await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(active));
+        await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(active));
         return true;
       }
       return false;
@@ -867,7 +975,7 @@ export const ensurePhotoMetadataFromUri = async (
       mimeType: 'image/jpeg',
     };
     active.push(newMeta);
-    await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(active));
+    await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(active));
     return true;
   } catch (error) {
     logger.warn('[ensurePhotoMetadataFromUri] Erro:', error);
@@ -883,7 +991,7 @@ export const ensurePhotoMetadataFromUri = async (
 export const ensurePhotoMetadataById = async (photoId: string, obraId: string): Promise<boolean> => {
   if (!photoId) return false;
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+    const results = await runExclusiveMetadata(() => multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]));
     const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
     const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
 
@@ -941,10 +1049,10 @@ export const ensurePhotoMetadataById = async (photoId: string, obraId: string): 
  * após MAX_RETRIES falhas (geralmente por problema de rede temporário).
  * Retorna o número de fotos resetadas.
  */
-export const resetLostPhotosByIds = async (photoIds: string[]): Promise<number> => {
+const resetLostPhotosByIdsUnlocked = async (photoIds: string[]): Promise<number> => {
   if (!photoIds || photoIds.length === 0) return 0;
   try {
-    const raw = await AsyncStorage.getItem(PHOTO_METADATA_KEY);
+    const raw = await getMetaItem(PHOTO_METADATA_KEY);
     const active: PhotoMetadata[] = raw ? JSON.parse(raw) : [];
     let count = 0;
     const next = active.map((m) => {
@@ -955,7 +1063,7 @@ export const resetLostPhotosByIds = async (photoIds: string[]): Promise<number> 
       return { ...m, lost: false, retries: 0, lostAt: undefined, lostReason: undefined } as PhotoMetadata;
     });
     if (count > 0) {
-      await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(next));
+      await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(next));
     }
     return count;
   } catch (error) {
@@ -967,14 +1075,13 @@ export const resetLostPhotosByIds = async (photoIds: string[]): Promise<number> 
 /**
  * Atualiza caminhos locais de uma foto (usado para autocorrecao de metadata)
  */
-export const updatePhotoPaths = async (
+const updatePhotoPathsUnlocked = async (
   photoId: string,
   updates: Partial<Pick<PhotoMetadata, 'originalUri' | 'backupPath' | 'compressedPath'>>
 ): Promise<boolean> => {
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
-    const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
-    const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
+    // O arquivo de enviadas pode ter dezenas de MB: só é lido se a foto não estiver nas ativas.
+    const active = await readMetaArray(PHOTO_METADATA_KEY);
 
     const applyUpdates = (photo: PhotoMetadata) => {
       if (typeof updates.originalUri === 'string' && updates.originalUri.length > 0) {
@@ -991,14 +1098,15 @@ export const updatePhotoPaths = async (
     const activeIdx = active.findIndex(m => m.id === photoId);
     if (activeIdx !== -1) {
       applyUpdates(active[activeIdx]);
-      await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(active));
+      await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(active));
       return true;
     }
 
+    const archived = await readMetaArray(PHOTO_METADATA_ARCHIVED_KEY);
     const archivedIdx = archived.findIndex(m => m.id === photoId);
     if (archivedIdx !== -1) {
       applyUpdates(archived[archivedIdx]);
-      await AsyncStorage.setItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
+      await setMetaItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
       return true;
     }
 
@@ -1014,9 +1122,9 @@ export const updatePhotoPaths = async (
  * Útil quando uma obra offline é sincronizada e recebe um novo ID do servidor
  * Também atualiza fotos cujo ID começa com o oldObraId (para cobrir casos de IDs compostos)
  */
-export const updatePhotosObraId = async (oldObraId: string, newObraId: string): Promise<number> => {
+const updatePhotosObraIdUnlocked = async (oldObraId: string, newObraId: string): Promise<number> => {
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
+    const results = await multiGetMeta([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
     const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
     const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
     let updatedCount = 0;
@@ -1029,7 +1137,7 @@ export const updatePhotosObraId = async (oldObraId: string, newObraId: string): 
       return photo;
     };
 
-    await AsyncStorage.multiSet([
+    await multiSetMeta([
       [PHOTO_METADATA_KEY, JSON.stringify(active.map(remap))],
       [PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived.map(remap))],
     ]);
@@ -1043,25 +1151,25 @@ export const updatePhotosObraId = async (oldObraId: string, newObraId: string): 
 /**
  * Incrementa contador de retries de uma foto
  */
-export const incrementPhotoRetries = async (photoId: string): Promise<void> => {
+const incrementPhotoRetriesUnlocked = async (photoId: string): Promise<void> => {
   try {
-    const results = await AsyncStorage.multiGet([PHOTO_METADATA_KEY, PHOTO_METADATA_ARCHIVED_KEY]);
-    const active: PhotoMetadata[] = results[0][1] ? JSON.parse(results[0][1]) : [];
-    const archived: PhotoMetadata[] = results[1][1] ? JSON.parse(results[1][1]) : [];
+    // O arquivo de enviadas pode ter dezenas de MB: só é lido se a foto não estiver nas ativas.
+    const active = await readMetaArray(PHOTO_METADATA_KEY);
 
     const activeIdx = active.findIndex(m => m.id === photoId);
     if (activeIdx !== -1) {
       active[activeIdx].retries++;
       active[activeIdx].lastRetryAt = new Date().toISOString();
-      await AsyncStorage.setItem(PHOTO_METADATA_KEY, JSON.stringify(active));
+      await setMetaItem(PHOTO_METADATA_KEY, JSON.stringify(active));
       return;
     }
 
+    const archived = await readMetaArray(PHOTO_METADATA_ARCHIVED_KEY);
     const archivedIdx = archived.findIndex(m => m.id === photoId);
     if (archivedIdx !== -1) {
       archived[archivedIdx].retries++;
       archived[archivedIdx].lastRetryAt = new Date().toISOString();
-      await AsyncStorage.setItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
+      await setMetaItem(PHOTO_METADATA_ARCHIVED_KEY, JSON.stringify(archived));
     }
   } catch (error) {
     logger.error('Erro ao incrementar retries:', error);
@@ -1195,29 +1303,101 @@ export const getStorageStats = async (): Promise<{
  */
 export const photoExists = async (photoId: string): Promise<boolean> => {
   try {
-    const allMetadata = await getAllPhotoMetadata();
-    const photo = allMetadata.find(m => m.id === photoId);
-
-    if (!photo) return false;
-
-    const candidates = [
-      photo.compressedPath,
-      photo.backupPath,
-      photo.originalUri,
-    ].filter((value): value is string => typeof value === 'string' && value.length > 0);
-
-    for (const candidate of candidates) {
-      try {
-        const info = await FileSystem.getInfoAsync(candidate);
-        if (info.exists) return true;
-      } catch {
-        // tenta o proximo caminho
-      }
-    }
-
-    return false;
+    return await photoExistsStrict(photoId);
   } catch (error) {
     logger.error('Erro ao verificar existencia da foto:', error);
     return false;
   }
 };
+
+/**
+ * Igual a photoExists, mas propaga falha de leitura do metadata. Quem decide marcar
+ * a foto como perdida precisa distinguir "arquivo não existe" de "não consegui ler o índice".
+ */
+export const photoExistsStrict = async (photoId: string): Promise<boolean> => {
+  const allMetadata = await readAllPhotoMetadataStrict();
+  const photo = allMetadata.find(m => m.id === photoId);
+
+  if (!photo) return false;
+
+  const candidates = [
+    photo.compressedPath,
+    photo.backupPath,
+    photo.originalUri,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+
+  for (const candidate of candidates) {
+    try {
+      const info = await FileSystem.getInfoAsync(candidate);
+      if (info.exists) return true;
+    } catch {
+      // tenta o proximo caminho
+    }
+  }
+
+  return false;
+};
+
+// ---------------------------------------------------------------------------
+// Escritas de metadata sob o mutex
+// ---------------------------------------------------------------------------
+//
+// Toda função abaixo faz read-modify-write das chaves de metadata: lê o array
+// inteiro, altera um item e reescreve. Duas delas rodando em paralelo fazem uma
+// sobrescrever a leitura da outra, e a alteração perdida some sem erro.
+//
+// Isso não é hipotético: processObraPhotos sobe 2 fotos por vez em Promise.all
+// (photo-queue.ts, BATCH_SIZE), e cada upload chama markPhotoAsUploaded,
+// incrementPhotoRetries ou markPhotoAsLost. Ou seja, a corrida acontece em todo
+// lote de sync. Se uma captura ocorrer durante o sync, a foto recém-tirada pode
+// ser apagada do índice por uma escrita atrasada do upload — arquivo em disco,
+// invisível para o app, nunca enviada.
+//
+// As versões `...Unlocked` acima continuam com o corpo original; o export passa
+// pelo mesmo runExclusiveMetadata que savePhotoMetadata já usava.
+//
+// Atenção ao alterar: o mutex NÃO é reentrante. Uma função travada não pode
+// chamar outra travada — trava para sempre. Por isso ensurePhotoMetadataById
+// (que chama ensurePhotoMetadataFromUri) fica de fora, assim como os leitores
+// (getAllPhotoMetadata, getPendingPhotos, getPhotoMetadatasByIds).
+
+export const pruneArchivedPhotoMetadata = (): Promise<number> =>
+  runExclusiveMetadata(() => pruneArchivedPhotoMetadataUnlocked());
+
+export const resetZombiePhotos = (obraId?: string): Promise<number> =>
+  runExclusiveMetadata(() => resetZombiePhotosUnlocked(obraId));
+
+export const markPhotoAsUploaded = (photoId: string, uploadUrl: string): Promise<void> =>
+  runExclusiveMetadata(() => markPhotoAsUploadedUnlocked(photoId, uploadUrl));
+
+export const markPhotoAsLost = (photoId: string, reason?: string): Promise<boolean> =>
+  runExclusiveMetadata(() => markPhotoAsLostUnlocked(photoId, reason));
+
+export const ensurePhotoMetadataFromUri = (
+  photoId: string,
+  localUri: string,
+  obraId: string,
+  latitude?: number | null,
+  longitude?: number | null,
+): Promise<boolean> =>
+  runExclusiveMetadata(() =>
+    ensurePhotoMetadataFromUriUnlocked(photoId, localUri, obraId, latitude, longitude)
+  );
+
+export const resetLostPhotosByIds = (photoIds: string[]): Promise<number> =>
+  runExclusiveMetadata(() => resetLostPhotosByIdsUnlocked(photoIds));
+
+export const updatePhotoPaths = (
+  photoId: string,
+  updates: Partial<Pick<PhotoMetadata, 'originalUri' | 'backupPath' | 'compressedPath'>>
+): Promise<boolean> =>
+  runExclusiveMetadata(() => updatePhotoPathsUnlocked(photoId, updates));
+
+export const updatePhotosObraId = (oldObraId: string, newObraId: string): Promise<number> =>
+  runExclusiveMetadata(() => updatePhotosObraIdUnlocked(oldObraId, newObraId));
+
+export const incrementPhotoRetries = (photoId: string): Promise<void> =>
+  runExclusiveMetadata(() => incrementPhotoRetriesUnlocked(photoId));
+
+export const archiveUploadedPhotos = (): Promise<number> =>
+  runExclusiveMetadata(() => archiveUploadedPhotosUnlocked());

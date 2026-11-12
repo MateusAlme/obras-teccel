@@ -57,6 +57,23 @@ async function writeIndex(ids: string[]): Promise<void> {
   await AsyncStorage.setItem(OBRAS_INDEX_KEY, JSON.stringify(ids));
 }
 
+/**
+ * Mutex em memória: serializa as mutações read-modify-write do índice de obras
+ * (saveObra / saveManyObras / removeObra / replaceAllObras). Sem isso, duas
+ * capturas em paralelo podem ler o mesmo índice antes de a outra escrever e uma
+ * entrada se perde — a obra fica salva na própria chave (`@obra:<id>`) mas some
+ * da listagem, exatamente o sintoma de "a obra sumiu". Mesmo padrão do
+ * runExclusiveMetadata em photo-backup.ts.
+ */
+let indexMutex: Promise<void> = Promise.resolve();
+
+const runExclusiveIndex = <T>(task: () => Promise<T>): Promise<T> => {
+  const result = indexMutex.then(task);
+  // Mantém a cadeia viva mesmo se a task rejeitar, sem propagar o erro para a próxima.
+  indexMutex = result.then(() => undefined, () => undefined);
+  return result;
+};
+
 /** Constrói um Map id→obra (última ocorrência vence) descartando obras sem id. */
 function toObraMap(list: LocalObra[]): Map<string, LocalObra> {
   const map = new Map<string, LocalObra>();
@@ -203,10 +220,12 @@ export async function saveObra(obra: LocalObra): Promise<void> {
     throw new Error('[obra-store] saveObra: obra sem id válido');
   }
   await AsyncStorage.setItem(obraKey(id), JSON.stringify(obra));
-  const ids = await readIndex();
-  if (!ids.includes(id)) {
-    await writeIndex([...ids, id]);
-  }
+  await runExclusiveIndex(async () => {
+    const ids = await readIndex();
+    if (!ids.includes(id)) {
+      await writeIndex([...ids, id]);
+    }
+  });
 }
 
 /** Salva/atualiza várias obras de uma vez, preservando as demais. */
@@ -219,27 +238,31 @@ export async function saveManyObras(list: LocalObra[]): Promise<void> {
     JSON.stringify(obra),
   ]);
   await AsyncStorage.multiSet(pairs);
-  const ids = await readIndex();
-  const set = new Set(ids);
-  let changed = false;
-  for (const id of map.keys()) {
-    if (!set.has(id)) {
-      ids.push(id);
-      set.add(id);
-      changed = true;
+  await runExclusiveIndex(async () => {
+    const ids = await readIndex();
+    const set = new Set(ids);
+    let changed = false;
+    for (const id of map.keys()) {
+      if (!set.has(id)) {
+        ids.push(id);
+        set.add(id);
+        changed = true;
+      }
     }
-  }
-  if (changed) await writeIndex(ids);
+    if (changed) await writeIndex(ids);
+  });
 }
 
 /** Remove uma obra (chave + entrada do índice). */
 export async function removeObra(id: string): Promise<void> {
   await ensureMigrated();
   await AsyncStorage.removeItem(obraKey(id));
-  const ids = await readIndex();
-  if (ids.includes(id)) {
-    await writeIndex(ids.filter((x) => x !== id));
-  }
+  await runExclusiveIndex(async () => {
+    const ids = await readIndex();
+    if (ids.includes(id)) {
+      await writeIndex(ids.filter((x) => x !== id));
+    }
+  });
 }
 
 /**
@@ -253,15 +276,17 @@ export async function replaceAllObras(list: LocalObra[]): Promise<void> {
   const newIds = Array.from(map.keys());
   const newSet = new Set(newIds);
 
-  const oldIds = await readIndex();
-  const toRemove = oldIds.filter((id) => !newSet.has(id)).map(obraKey);
-
   if (map.size > 0) {
     const pairs: [string, string][] = newIds.map((id) => [obraKey(id), JSON.stringify(map.get(id))]);
     await AsyncStorage.multiSet(pairs);
   }
-  await writeIndex(newIds);
-  if (toRemove.length) await AsyncStorage.multiRemove(toRemove);
+
+  await runExclusiveIndex(async () => {
+    const oldIds = await readIndex();
+    const toRemove = oldIds.filter((id) => !newSet.has(id)).map(obraKey);
+    await writeIndex(newIds);
+    if (toRemove.length) await AsyncStorage.multiRemove(toRemove);
+  });
 }
 
 /**
