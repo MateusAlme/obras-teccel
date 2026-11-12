@@ -1,6 +1,6 @@
 ﻿import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, Image, StyleSheet, Dimensions, TouchableOpacity, Platform } from 'react-native';
-import { latLongToUTM, formatUTM } from '../lib/geocoding';
+import { latLongToUTM, normalizeUtmZone } from '../lib/geocoding';
 import { getPhotoMetadataFallbackCandidatesByUri } from '../lib/photo-backup';
 
 const SCREEN_WIDTH = Dimensions.get('window').width;
@@ -196,13 +196,14 @@ function PhotoWithPlacaComponent({
     minute: '2-digit',
   });
 
-  // Calcular UTM se tiver coordenadas mas nao tiver UTM
-  let utmDisplay = '';
+  // UTM em partes (zona, E, N), sem separador de milhar: cada valor numa linha cabe na
+  // placa em qualquer largura de tela, em vez de uma linha longa que quebrava no meio.
+  let utmParts: { zone: string; easting: number; northing: number } | null = null;
   if (utmX && utmY && utmZone) {
-    utmDisplay = `${utmZone} ${Math.round(utmX).toLocaleString()}E ${Math.round(utmY).toLocaleString()}N`;
+    utmParts = { zone: normalizeUtmZone(utmZone), easting: Math.round(utmX), northing: Math.round(utmY) };
   } else if (latitude && longitude) {
     const utm = latLongToUTM(latitude, longitude);
-    utmDisplay = formatUTM(utm);
+    utmParts = { zone: normalizeUtmZone(utm.zone), easting: utm.x, northing: utm.y };
   }
 
   return (
@@ -286,12 +287,20 @@ function PhotoWithPlacaComponent({
             )}
 
             {/* UTM */}
-            {!!utmDisplay && (
+            {!!utmParts && (
               <>
                 <View style={styles.divider} />
                 <View style={styles.infoRow}>
                   <Text style={styles.label}>UTM:</Text>
-                  <Text style={styles.valueUtm}>{utmDisplay}</Text>
+                  <Text style={styles.valueUtm}>Zona {utmParts.zone}</Text>
+                </View>
+                <View style={styles.infoRow}>
+                  <Text style={styles.label}>E:</Text>
+                  <Text style={styles.valueUtm}>{utmParts.easting}</Text>
+                </View>
+                <View style={styles.infoRowLast}>
+                  <Text style={styles.label}>N:</Text>
+                  <Text style={styles.valueUtm}>{utmParts.northing}</Text>
                 </View>
               </>
             )}
@@ -354,6 +363,10 @@ const styles = StyleSheet.create({
     marginBottom: SCREEN_WIDTH * 0.015,
     alignItems: 'center',
   },
+  infoRowLast: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
   label: {
     fontSize: Math.max(11, SCREEN_WIDTH * 0.032), // Responsivo, minimo 11px
     fontWeight: '700',
@@ -376,7 +389,8 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
   },
   valueUtm: {
-    fontSize: Math.max(10, SCREEN_WIDTH * 0.028),
+    fontSize: Math.max(11, SCREEN_WIDTH * 0.032),
+    fontVariant: ['tabular-nums'],
     fontWeight: '800',
     color: 'rgba(0, 130, 80, 1)', // Verde escuro para contraste
     flex: 1,

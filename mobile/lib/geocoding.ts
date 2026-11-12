@@ -155,5 +155,22 @@ export function latLongToUTM(latitude: number, longitude: number): UTMCoordinate
  * Formatar coordenadas UTM para exibição
  */
 export function formatUTM(utm: UTMCoordinates): string {
-  return `${utm.zone} ${utm.x.toLocaleString()}E ${utm.y.toLocaleString()}N`;
+  // Sem separador de milhar: toLocaleString() sem locale varia por aparelho
+  // ("245,123" num, "245.123" noutro) e confunde a leitura da coordenada.
+  return `${utm.zone} ${Math.round(utm.x)}E ${Math.round(utm.y)}N`;
+}
+
+/**
+ * Padroniza a zona UTM para o formato "<numero><hemisferio>" (ex.: 24S).
+ * O backup da foto guarda a letra de faixa de latitude ("24M" para a Paraíba),
+ * enquanto latLongToUTM devolve o hemisfério ("24S"). O mesmo ponto aparecia
+ * com duas zonas diferentes dependendo de onde o dado vinha.
+ */
+export function normalizeUtmZone(zone: string | null | undefined): string {
+  const match = String(zone ?? '').trim().toUpperCase().match(/^(\d{1,2})\s*([C-HJ-NP-X])$/);
+  if (!match) return String(zone ?? '').trim();
+  const [, number, letter] = match;
+  // Faixas C..M ficam no hemisfério sul; N..X no norte. "S" já é o hemisfério sul usado aqui.
+  const southern = letter === 'S' || letter < 'N';
+  return `${number}${southern ? 'S' : 'N'}`;
 }
