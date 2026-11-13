@@ -25,8 +25,9 @@ const STALE_UPLOADING_MS = 150_000; // "uploading" sem atualizacao por 2m30s vol
 // mantido separado aqui pra não puxar o client inteiro só por essas duas
 // constantes, mas precisa ficar em sincronia pro upload ir pro mesmo projeto
 // que o resto do app usa.
-const SUPABASE_STORAGE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL || 'https://hiuagpzaelcocyxutgdt.supabase.co';
-const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhpdWFncHphZWxjb2N5eHV0Z2R0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE3NDE1ODAsImV4cCI6MjA3NzMxNzU4MH0.sEp1yx9p_RGPWUIQ1bzE2aYx1YdPiKHFZJ-GnG4a-N8';
+// Mesma regra de lib/supabase.ts: produção sempre, exceto no app de desenvolvimento apontando para o Supabase local.
+const SUPABASE_STORAGE_URL = (__DEV__ && process.env.EXPO_PUBLIC_SUPABASE_URL) || 'https://hiuagpzaelcocyxutgdt.supabase.co';
+const SUPABASE_ANON_KEY = (__DEV__ && process.env.EXPO_PUBLIC_SUPABASE_URL && process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY) || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhpdWFncHphZWxjb2N5eHV0Z2R0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE3NDE1ODAsImV4cCI6MjA3NzMxNzU4MH0.sEp1yx9p_RGPWUIQ1bzE2aYx1YdPiKHFZJ-GnG4a-N8';
 
 /**
  * Qualidade da conexao atual.
