@@ -17,6 +17,7 @@ import { ObraContainer, ServiceCard, ServiceTypeSelector } from '../../component
 import { isAdminOrSupervisor } from '../../lib/profile-rules';
 import type { Servico, SyncStatusServico, TipoServico, FotoInfo as ServicoFotoInfo } from '../../types/servico';
 import { fetchServicosForObra, createServico, markServicoComplete, appendPhotoToServicoLocal } from '../../lib/servico-sync';
+import { requestMediaLibraryPermissionsCompat } from '../../lib/media-permissions';
 
 const isUuid = (value: string): boolean =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -1038,7 +1039,7 @@ export default function Obras() {
 
     try {
       setCaptureLoading(true);
-      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const permissionResult = await requestMediaLibraryPermissionsCompat();
 
       if (!permissionResult.granted) {
         Alert.alert('Permissão negada', 'É necessário permitir acesso à galeria.');

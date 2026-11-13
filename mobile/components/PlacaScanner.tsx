@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { parsePlacaText, PlacaInfo, isValidPlacaInfo } from '../lib/placa-parser';
+import { requestMediaLibraryPermissionsCompat } from '../lib/media-permissions';
 
 interface PlacaScannerProps {
   visible: boolean;
@@ -58,7 +59,7 @@ export const PlacaScanner: React.FC<PlacaScannerProps> = ({
 
   const handleSelectImage = async () => {
     try {
-      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const permissionResult = await requestMediaLibraryPermissionsCompat();
 
       if (!permissionResult.granted) {
         Alert.alert('Permissão negada', 'É necessário permitir acesso à galeria.');

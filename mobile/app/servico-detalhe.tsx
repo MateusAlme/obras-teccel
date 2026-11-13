@@ -15,6 +15,7 @@ import { appendPhotoToServicoLocal, fetchServicosForObra, markServicoComplete, s
 import { backupPhoto, getPhotoMetadatasByIds, type PhotoMetadata } from '../lib/photo-backup';
 import { processObraPhotos } from '../lib/photo-queue';
 import { getVisiblePhotoCategories, validateServicoCompletion } from '../lib/servico-rules';
+import { requestMediaLibraryPermissionsCompat } from '../lib/media-permissions';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -529,7 +530,7 @@ export default function ServicoDetalhePage() {
     try {
       setCaptureLoading(true);
       setShowPhotoSource(false);
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const perm = await requestMediaLibraryPermissionsCompat();
       if (!perm.granted) {
         Alert.alert('Permissão negada', 'Permita acesso à galeria.');
         return;

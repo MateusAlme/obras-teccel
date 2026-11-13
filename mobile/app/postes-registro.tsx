@@ -25,6 +25,7 @@ import { type Servico, type FotoInfo, type PosteData } from '../types/servico';
 import NetInfo from '@react-native-community/netinfo';
 import { fetchServicosForObra, saveServicoLocal, syncServico } from '../lib/servico-sync';
 import { backupPhoto, getPhotoMetadatasByIds, type PhotoMetadata } from '../lib/photo-backup';
+import { requestMediaLibraryPermissionsCompat } from '../lib/media-permissions';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -603,7 +604,7 @@ export default function PostesRegistroPage() {
     if (!captureTarget) return;
     try {
       setCaptureLoading(true);
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const perm = await requestMediaLibraryPermissionsCompat();
       if (!perm.granted) {
         Alert.alert('Permissão negada', 'Permita o acesso à galeria.');
         return;

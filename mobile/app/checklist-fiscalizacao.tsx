@@ -33,6 +33,7 @@ import {
 import NetInfo from '@react-native-community/netinfo';
 import { fetchServicosForObra, saveServicoLocal, syncServico } from '../lib/servico-sync';
 import { backupPhoto, getPhotoMetadatasByIds, type PhotoMetadata } from '../lib/photo-backup';
+import { requestMediaLibraryPermissionsCompat } from '../lib/media-permissions';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const THUMB_SIZE = (SCREEN_WIDTH - 32 - 12) / 4;
@@ -1032,7 +1033,7 @@ export default function ChecklistFiscalizacaoPage() {
 
     try {
       setCaptureLoading(true);
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const permission = await requestMediaLibraryPermissionsCompat();
       if (!permission.granted) {
         Alert.alert('Permissão negada', 'Permita o acesso à galeria para selecionar fotos.');
         return;

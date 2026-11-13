@@ -51,6 +51,7 @@ import { renderPhotoWithPlacaBurnedIn } from '../lib/photo-with-placa';
 import { theme } from '../theme';
 import { useToast } from '../components/Toast';
 import { isCompressorProfile, isLinhaVivaProfile, isAdminOrSupervisor } from '../lib/profile-rules';
+import { requestMediaLibraryPermissionsCompat } from '../lib/media-permissions';
 // Import dinâmico (lazy) para evitar erro no web
 // import { renderPhotoWithPlacaBurnedIn } from '../lib/photo-with-placa';
 
@@ -2063,7 +2064,7 @@ export default function NovaObra() {
       // PROTEÇÃO: Timeout de 30 segundos para solicitação de permissões
       const mediaPermissionPromise = source === 'camera'
         ? ImagePicker.requestCameraPermissionsAsync()
-        : ImagePicker.requestMediaLibraryPermissionsAsync();
+        : requestMediaLibraryPermissionsCompat();
       const permissionsPromise = needsLocation
         ? Promise.all([mediaPermissionPromise, Location.requestForegroundPermissionsAsync()])
         : Promise.all([mediaPermissionPromise]);

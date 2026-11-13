@@ -23,6 +23,7 @@ import {
   isServiceTypeAllowedForProfile,
   isAdminOrSupervisor,
 } from '../lib/profile-rules';
+import { requestMediaLibraryPermissionsCompat } from '../lib/media-permissions';
 
 type ObraListItem = {
   id: string;
@@ -1699,7 +1700,7 @@ export default function ObraBooksPage() {
 
     try {
       setCaptureLoading(true);
-      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const permissionResult = await requestMediaLibraryPermissionsCompat();
       if (!permissionResult.granted) {
         Alert.alert('Permissão negada', 'É necessário permitir acesso à galeria.');
         return;

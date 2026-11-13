@@ -29,16 +29,14 @@
         "backgroundColor": "#FF0000"
       },
       "package": "com.obraswise.mobile",
-      "versionCode": 13,
+      "versionCode": 14,
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.READ_MEDIA_IMAGES",
-        "android.permission.ACCESS_MEDIA_LOCATION",
-        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+        "android.permission.ACCESS_MEDIA_LOCATION"
       ],
       "config": {
         "googleMaps": {
@@ -50,7 +48,9 @@
       "enableShrinkResourcesInReleaseBuilds": true,
       "blockedPermissions": [
         "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.READ_MEDIA_IMAGES",
         "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
         "android.permission.RECORD_AUDIO"
       ]
     },
@@ -79,9 +79,7 @@
           "photosPermission": "Este app precisa salvar fotos das obras na sua galeria.",
           "savePhotosPermission": "Este app precisa salvar fotos das obras na sua galeria.",
           "isAccessMediaLocationEnabled": true,
-          "granularPermissions": [
-            "photo"
-          ]
+          "granularPermissions": []
         }
       ]
     ],
