@@ -1,6 +1,8 @@
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, RefreshControl, ActivityIndicator, Alert, TextInput, useWindowDimensions } from 'react-native';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useRouter, useFocusEffect } from 'expo-router';
+import { Ionicons } from '@expo/vector-icons';
+import { theme } from '../../theme';
 import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../../lib/supabase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -87,6 +89,7 @@ export default function Obras() {
   const [isOnline, setIsOnline] = useState(true);
   const [syncingPending, setSyncingPending] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [filtro, setFiltro] = useState<'todas' | 'andamento' | 'concluidas' | 'envio'>('todas');
   const [debouncedSearchTerm, setDebouncedSearchTerm] = useState('');
   const [equipeLogada, setEquipeLogada] = useState<string>('');
   const [userRole, setUserRole] = useState<string>('equipe');
@@ -221,16 +224,87 @@ export default function Obras() {
 
   // Janela de exibicao: renderiza so as primeiras N obras e cresce ao rolar.
   const [visibleCount, setVisibleCount] = useState(OBRAS_PAGE_SIZE);
-  const visibleGroupedObras = useMemo(
-    () => groupedFilteredObras.slice(0, visibleCount),
-    [groupedFilteredObras, visibleCount]
+  // Estado de cada obra (agrupada por número) para os filtros rápidos e para a linha da lista.
+  const pendingObrasDaEquipe = useMemo(() => {
+    if (isAdmin) return pendingObrasState;
+    if (!equipeLogada) return [];
+
+    return pendingObrasState.filter((obra) => {
+      if (obra.equipe !== equipeLogada) return false;
+      if (!isCompressor) return true;
+      return isCompressorBook(obra as any);
+    });
+  }, [pendingObrasState, equipeLogada, isCompressor, isAdmin]);
+
+  const idsPendentes = useMemo(
+    () => new Set<string>(pendingObrasDaEquipe.map((o) => String(o.id))),
+    [pendingObrasDaEquipe]
   );
-  const hasMoreObras = visibleCount < groupedFilteredObras.length;
+
+  const infoDoGrupo = useCallback((grupo: GroupedObra) => {
+    const idsDaObra = new Set<string>();
+    grupo.itens.forEach((item: any) => {
+      if (item?.id) idsDaObra.add(item.id);
+      if (item?.serverId) idsDaObra.add(item.serverId);
+    });
+    const servicosDb: Servico[] = [];
+    const vistos = new Set<string>();
+    grupo.itens.forEach((item) => {
+      for (const sv of servicosPorObra[item.id] || []) {
+        if (!vistos.has(sv.id)) { vistos.add(sv.id); servicosDb.push(sv); }
+      }
+    });
+    const contagemTipos = new Map<string, number>();
+    servicosDb.forEach((sv) => contagemTipos.set(sv.tipo_servico, (contagemTipos.get(sv.tipo_servico) || 0) + 1));
+    grupo.itens.forEach((item) => {
+      const tipo = String(item.tipo_servico || '').trim();
+      if (tipo) contagemTipos.set(tipo, (contagemTipos.get(tipo) || 0) + 1);
+    });
+    let fotosPendentes = 0;
+    idsDaObra.forEach((id) => { fotosPendentes += fotosPendentesPorObra[id] || 0; });
+    const concluida = servicosDb.length > 0
+      ? servicosDb.every((sv) => sv.status === 'completo')
+      : grupo.principal.status === 'finalizada';
+    // Só conta como pendente o que está de fato na fila de envio (a mesma que o Início usa).
+    // Obra que já subiu mas ainda guarda cópia local não é "aguardando envio".
+    const aguardandoEnvio =
+      fotosPendentes > 0 ||
+      grupo.itens.some((item) => idsPendentes.has(item.id) || (item.serverId ? idsPendentes.has(item.serverId) : false));
+    const falhou = grupo.itens.some((item) => item.sync_status === 'failed');
+    return { tipos: Array.from(contagemTipos.entries()), concluida, aguardandoEnvio, falhou, fotosPendentes };
+  }, [servicosPorObra, fotosPendentesPorObra, idsPendentes]);
+
+  const contagemFiltros = useMemo(() => {
+    const c = { todas: 0, andamento: 0, concluidas: 0, envio: 0 };
+    for (const g of groupedFilteredObras) {
+      const info = infoDoGrupo(g);
+      c.todas += 1;
+      if (info.concluida) c.concluidas += 1; else c.andamento += 1;
+      if (info.aguardandoEnvio) c.envio += 1;
+    }
+    return c;
+  }, [groupedFilteredObras, infoDoGrupo]);
+
+  const gruposDoFiltro = useMemo(() => {
+    if (filtro === 'todas') return groupedFilteredObras;
+    return groupedFilteredObras.filter((g) => {
+      const info = infoDoGrupo(g);
+      if (filtro === 'concluidas') return info.concluida;
+      if (filtro === 'andamento') return !info.concluida;
+      return info.aguardandoEnvio;
+    });
+  }, [groupedFilteredObras, filtro, infoDoGrupo]);
+
+  const visibleGroupedObras = useMemo(
+    () => gruposDoFiltro.slice(0, visibleCount),
+    [gruposDoFiltro, visibleCount]
+  );
+  const hasMoreObras = visibleCount < gruposDoFiltro.length;
 
   // Volta ao topo da janela quando a busca muda (resultado novo, lista curta).
   useEffect(() => {
     setVisibleCount(OBRAS_PAGE_SIZE);
-  }, [debouncedSearchTerm]);
+  }, [debouncedSearchTerm, filtro]);
 
   const handleLoadMoreObras = useCallback(() => {
     setVisibleCount((atual) =>
@@ -287,17 +361,6 @@ export default function Obras() {
   }, []);
 
   // ✅ Filtrar obras pendentes apenas da equipe logada para contadores
-  const pendingObrasDaEquipe = useMemo(() => {
-    if (isAdmin) return pendingObrasState;
-    if (!equipeLogada) return [];
-
-    return pendingObrasState.filter((obra) => {
-      if (obra.equipe !== equipeLogada) return false;
-      if (!isCompressor) return true;
-      return isCompressorBook(obra as any);
-    });
-  }, [pendingObrasState, equipeLogada, isCompressor, isAdmin]);
-
   const hasOfflineSyncIssues = useMemo(() => {
     return combinedObras.some((obra) => {
       if (obra.origem !== 'offline') return false;
@@ -1346,82 +1409,87 @@ export default function Obras() {
 
   const renderObraGrupo = useCallback(({ item: grupo }: { item: GroupedObra }) => {
     const obra = grupo.principal;
-    const obraIds = grupo.itens.map((item) => item.id);
-
-    const servicosDb = obraIds.flatMap((id) => servicosPorObra[id] || []);
-    const servicosDbUnicos = servicosDb.filter((servico, index, lista) =>
-      lista.findIndex((item) => item.id === servico.id) === index
-    );
-    const legacyServicos = grupo.itens.map((item) => ({
-      ...(item as any),
-      id: `legacy-${item.id}-servico`,
-      obra_id: item.id,
-      tipo_servico: (item.tipo_servico || 'Documentação') as TipoServico,
-      responsavel: item.responsavel,
-      status: item.status === 'finalizada' ? 'completo' : 'rascunho',
-      sync_status: toSyncStatusServico(item),
-      created_at: item.created_at,
-      updated_at: item.created_at,
-      fotos_antes: (item as any).fotos_antes || [],
-      fotos_durante: (item as any).fotos_durante || [],
-      fotos_depois: (item as any).fotos_depois || [],
-    } as Servico));
-    const legacyServicosUnicos = legacyServicos.filter((servico, index, lista) =>
-      lista.findIndex((item) => item.id === servico.id) === index
-    );
-    const servicosRender = [...servicosDbUnicos, ...legacyServicosUnicos];
-
-    let displayStatus: 'em_aberto' | 'rascunho' | 'finalizada' = obra.status || 'em_aberto';
-    if (servicosDbUnicos.length > 0) {
-      displayStatus = servicosDbUnicos.every((s) => s.status === 'completo') ? 'finalizada' : 'em_aberto';
-    }
+    const info = infoDoGrupo(grupo);
+    const totalServicos = info.tipos.reduce((soma, [, n]) => soma + n, 0);
+    const podeSincronizar = obra.origem === 'offline' && !obra.serverId;
 
     return (
       <View style={styles.obraGroupItem}>
-        <ObraContainer
-          obraId={grupo.groupKey}
-          obraData={formatarData(obra.data)}
-          obraTitle={grupo.obraNumero}
-          responsavel={obra.responsavel}
-          equipe={obra.equipe}
-          status={displayStatus}
-          servicos={servicosRender}
-          isExpanded={false}
-          onToggleExpand={() => handleOpenObraBooksPage(grupo)}
-          onAddService={() => handleOpenObraBooksPage(grupo)}
-        />
-        {renderStatusBadge(obra)}
-        {(() => {
-          // Soma as fotos pendentes de todos os ids desta obra (local e do servidor).
-          const idsDaObra = new Set<string>();
-          grupo.itens.forEach((item: any) => {
-            if (item?.id) idsDaObra.add(item.id);
-            if (item?.serverId) idsDaObra.add(item.serverId);
-          });
-          let pendentes = 0;
-          idsDaObra.forEach((id) => { pendentes += fotosPendentesPorObra[id] || 0; });
-          if (pendentes === 0) return null;
-          return (
-            <View style={styles.fotosPendentesBadge}>
-              <Text style={styles.fotosPendentesTexto}>
-                ☁️ {pendentes} foto{pendentes > 1 ? 's' : ''} aguardando envio
+        <TouchableOpacity
+          style={styles.obraLinha}
+          activeOpacity={0.75}
+          onPress={() => handleOpenObraBooksPage(grupo)}
+        >
+          <View style={styles.obraLinhaTopo}>
+            <View style={styles.obraLinhaTextos}>
+              <Text style={styles.obraNumeroLinha} numberOfLines={1}>{grupo.obraNumero || 'Sem número'}</Text>
+              <Text style={styles.obraMeta} numberOfLines={1}>
+                {formatarData(obra.data)}{obra.equipe ? `  ·  ${obra.equipe}` : ''}
               </Text>
             </View>
-          );
-        })()}
-        {obra.origem === 'offline' && !obra.serverId && (
-          <View style={styles.cardFooter}>
-            <TouchableOpacity style={styles.syncObraButton} onPress={() => handleSyncSingleObra(obra)}>
-              <Text style={styles.syncObraButtonText}>Sincronizar obra</Text>
+            <View style={[styles.estadoChip, info.concluida && styles.estadoChipOk]}>
+              <Text style={[styles.estadoChipTexto, info.concluida && styles.estadoChipTextoOk]}>
+                {info.concluida ? 'Concluída' : 'Em andamento'}
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.addServico}
+              onPress={() => handleOpenObraBooksPage(grupo)}
+              accessibilityLabel="Adicionar serviço"
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Ionicons name="add" size={20} color={theme.colors.primary} />
             </TouchableOpacity>
           </View>
-        )}
+
+          <View style={styles.tiposLinha}>
+            {info.tipos.slice(0, 3).map(([tipo, n]) => (
+              <View key={tipo} style={styles.tipoChip}>
+                <Text style={styles.tipoChipTexto} numberOfLines={1}>{n > 1 ? `${tipo} ×${n}` : tipo}</Text>
+              </View>
+            ))}
+            {info.tipos.length > 3 && (
+              <Text style={styles.tiposMais}>+{info.tipos.length - 3}</Text>
+            )}
+          </View>
+
+          <View style={styles.obraRodape}>
+            <Text style={styles.obraRodapeTexto}>
+              {totalServicos} {totalServicos === 1 ? 'serviço' : 'serviços'}
+            </Text>
+            {info.falhou ? (
+              <View style={styles.statusInline}>
+                <Ionicons name="alert-circle-outline" size={14} color={theme.colors.primary} />
+                <Text style={[styles.obraRodapeTexto, { color: theme.colors.primary }]}>Falha ao enviar</Text>
+              </View>
+            ) : info.aguardandoEnvio ? (
+              <View style={styles.statusInline}>
+                <Ionicons name="cloud-upload-outline" size={14} color={theme.colors.textMuted} />
+                <Text style={styles.obraRodapeTexto}>
+                  {info.fotosPendentes > 0
+                    ? `${info.fotosPendentes} ${info.fotosPendentes === 1 ? 'foto' : 'fotos'} para enviar`
+                    : isOnline ? 'Enviando...' : 'Envia ao conectar'}
+                </Text>
+              </View>
+            ) : (
+              <View style={styles.statusInline}>
+                <Ionicons name="checkmark-circle-outline" size={14} color={theme.colors.textSubtle} />
+                <Text style={styles.obraRodapeTexto}>Enviada</Text>
+              </View>
+            )}
+            {podeSincronizar && (
+              <TouchableOpacity onPress={() => handleSyncSingleObra(obra)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Text style={styles.enviarLink}>Enviar</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </TouchableOpacity>
       </View>
     );
-  }, [servicosPorObra, fotosPendentesPorObra, handleOpenObraBooksPage, handleSyncSingleObra, handleDeleteObra, renderStatusBadge, toSyncStatusServico, formatarData]);
+  }, [infoDoGrupo, handleOpenObraBooksPage, handleSyncSingleObra, formatarData]);
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+    <SafeAreaView style={styles.safeArea} edges={['bottom']}>
       <FlatList
         style={styles.container}
         contentContainerStyle={[
@@ -1444,60 +1512,49 @@ export default function Obras() {
           hasMoreObras ? (
             <TouchableOpacity style={styles.loadMoreButton} onPress={handleLoadMoreObras} activeOpacity={0.7}>
               <Text style={styles.loadMoreText}>
-                Carregar mais ({groupedFilteredObras.length - visibleGroupedObras.length} restantes)
+                Carregar mais ({gruposDoFiltro.length - visibleGroupedObras.length} restantes)
               </Text>
             </TouchableOpacity>
           ) : null
         }
         ListHeaderComponent={
           <View>
-            {equipeLogada && (
-              <View style={styles.equipeBanner}>
-                <View style={styles.equipeInfo}>
-                  <Text style={styles.equipeLabel}>Equipe logada:</Text>
-                  <Text style={styles.equipeNome}>{equipeLogada}</Text>
-                </View>
-                <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
-                  <Text style={styles.logoutButtonText}>Sair</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-
-            <View style={[styles.header, isSmallScreen && styles.headerSmall]}>
-              <View style={styles.headerTop}>
-                <Text style={[styles.title, isSmallScreen && styles.titleSmall]}>Obras</Text>
-                <Text style={[styles.subtitle, isSmallScreen && styles.subtitleSmall]}>{subtitleText}</Text>
-              </View>
-              {!isOnline && (
-                <View style={[styles.offlinePill, isSmallScreen && styles.offlinePillSmall]}>
-                  <Text style={styles.offlineHint}>Modo Offline</Text>
-                </View>
-              )}
-            </View>
-
-            <View style={[styles.metricsRow, isSmallScreen && styles.metricsRowStacked]}>
-              <View style={[styles.metricCard, isSmallScreen && styles.metricCardStacked]}>
-                <Text style={styles.metricLabel}>{isAdmin ? 'Total geral' : 'Total da equipe'}</Text>
-                <Text style={styles.metricValue}>{combinedObras.length}</Text>
-              </View>
-              <View style={[styles.metricCard, isSmallScreen && styles.metricCardStacked]}>
-                <Text style={styles.metricLabel}>Pendentes</Text>
-                <Text style={[styles.metricValue, manualSyncPendingCount > 0 && styles.metricValueAlert]}>
-                  {manualSyncPendingCount}
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.searchContainer}>
-              <Text style={styles.searchPrefix}>Buscar</Text>
+            <View style={styles.buscaBox}>
+              <Ionicons name="search-outline" size={18} color={theme.colors.textSubtle} />
               <TextInput
-                style={styles.searchInput}
-                placeholder="Buscar por obra, responsavel ou equipe"
+                style={styles.buscaInput}
+                placeholder="Buscar por obra, responsável ou equipe"
+                placeholderTextColor={theme.colors.textSubtle}
                 value={searchTerm}
                 onChangeText={setSearchTerm}
                 autoCorrect={false}
                 autoCapitalize="none"
               />
+              {searchTerm.length > 0 && (
+                <TouchableOpacity onPress={() => setSearchTerm('')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  <Ionicons name="close-circle" size={18} color={theme.colors.textSubtle} />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <View style={styles.filtrosLinha}>
+              {([
+                ['todas', 'Todas'],
+                ['andamento', 'Em andamento'],
+                ['concluidas', 'Concluídas'],
+                ['envio', 'Para enviar'],
+              ] as const).map(([chave, rotulo]) => (
+                <TouchableOpacity
+                  key={chave}
+                  style={[styles.filtroChip, filtro === chave && styles.filtroChipAtivo]}
+                  onPress={() => setFiltro(chave)}
+                  activeOpacity={0.8}
+                >
+                  <Text style={[styles.filtroTexto, filtro === chave && styles.filtroTextoAtivo]}>
+                    {rotulo} {contagemFiltros[chave]}
+                  </Text>
+                </TouchableOpacity>
+              ))}
             </View>
 
             {(photoStats.failed > 0 || photoStats.pending > 0 || photoStats.uploading > 0) ? (
@@ -1539,10 +1596,6 @@ export default function Obras() {
                     )}
                   </TouchableOpacity>
                 )}
-              </View>
-            ) : (combinedObras.length > 0 && !hasOfflineSyncIssues) ? (
-              <View style={styles.photoSyncBannerAll}>
-                <Text style={styles.photoSyncBannerAllText}>Todas as fotos sincronizadas</Text>
               </View>
             ) : null}
 
@@ -1641,16 +1694,71 @@ export default function Obras() {
 }
 
 const styles = StyleSheet.create({
+  obraLinha: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.card,
+    padding: 14,
+    ...theme.cardShadow,
+  },
+  obraLinhaTopo: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  obraLinhaTextos: { flex: 1 },
+  obraNumeroLinha: { fontSize: 18, fontWeight: '700', color: theme.colors.text },
+  obraMeta: { fontSize: 12, color: theme.colors.textMuted, marginTop: 2 },
+  estadoChip: {},
+  estadoChipOk: {},
+  estadoChipTexto: { fontSize: 12, fontWeight: '700', color: theme.colors.primary },
+  estadoChipTextoOk: { color: theme.colors.textBody },
+  addServico: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: theme.colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tiposLinha: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 10 },
+  tipoChip: { backgroundColor: theme.colors.background, borderRadius: theme.radius.pill, paddingHorizontal: 10, paddingVertical: 4, maxWidth: '100%' },
+  tipoChipTexto: { fontSize: 12, fontWeight: '600', color: theme.colors.textStrong },
+  tiposMais: { fontSize: 12, fontWeight: '600', color: theme.colors.textMuted },
+  obraRodape: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 10 },
+  obraRodapeTexto: { fontSize: 12, color: theme.colors.textMuted },
+  statusInline: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  enviarLink: { fontSize: 13, fontWeight: '700', color: theme.colors.primary, marginLeft: 'auto' },
+  buscaBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.input,
+    borderWidth: 1,
+    borderColor: theme.colors.borderInput,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+  },
+  buscaInput: { flex: 1, fontSize: 15, color: theme.colors.text, paddingVertical: 11 },
+  filtrosLinha: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
+  filtroChip: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.pill,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  filtroChipAtivo: { backgroundColor: theme.colors.primary, borderColor: theme.colors.primary },
+  filtroTexto: { fontSize: 13, fontWeight: '600', color: theme.colors.textBody },
+  filtroTextoAtivo: { color: theme.colors.textOnPrimary },
   safeArea: {
     flex: 1,
-    backgroundColor: '#eef2f6',
+    backgroundColor: theme.colors.background,
   },
   container: {
     flex: 1,
-    backgroundColor: '#eef2f6',
+    backgroundColor: theme.colors.background,
   },
   content: {
-    paddingVertical: 18,
+    paddingVertical: 12,
   },
   obraGroupItem: {
     marginBottom: 12,

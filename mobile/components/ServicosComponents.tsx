@@ -20,14 +20,17 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 import { Ionicons } from '@expo/vector-icons';
+import * as FileSystem from 'expo-file-system/legacy';
+import { savePhotoToGallery } from '../lib/save-to-gallery';
+import { getPhotoMetadatasByIds } from '../lib/photo-backup';
 import { Servico, TipoServico, FotoInfo, StatusServico, SyncStatusServico, SERVICO_PHOTO_MAP } from '../types/servico';
 import { getVisiblePhotoCategories, validateServicoCompletion } from '../lib/servico-rules';
 
 // ==================== COLORS & STYLES ====================
 const colors = {
-  primary: '#2563EB',
-  primaryLight: '#EFF6FF',
-  primaryBorder: '#BFDBFE',
+  primary: '#DC2626',
+  primaryLight: '#FEF2F2',
+  primaryBorder: '#FECACA',
   secondary: '#6C757D',
   success: '#059669',
   successLight: '#ECFDF5',
@@ -155,7 +158,7 @@ const ObraContainerComponent: React.FC<ObraContainerProps> = ({
   const getStatusConfig = (s: string) => {
     switch (s) {
       case 'em_aberto':
-        return { bg: '#EFF6FF', text: '#1D4ED8', accent: '#2563EB', label: 'Em Aberto' };
+        return { bg: '#FEF2F2', text: '#B91C1C', accent: '#DC2626', label: 'Em Aberto' };
       case 'finalizada':
         return { bg: '#ECFDF5', text: '#065F46', accent: '#059669', label: 'Finalizada' };
       case 'rascunho':
@@ -310,6 +313,7 @@ type LegacyPosteSectionSummary = {
   key: string;
   label: string;
   count: number;
+  photos: unknown[];
 };
 
 type LegacyPosteSummary = {
@@ -635,6 +639,7 @@ const collectLegacyPostesSummary = (source: Record<string, any>, tipoServico?: s
           key: field,
           label,
           count: getArrayCount(poste?.[field]),
+          photos: Array.isArray(poste?.[field]) ? poste[field] : [],
         }))
         .filter((section) => section.count > 0);
 
@@ -784,6 +789,63 @@ const LazyThumbnailImage: React.FC<{ uri: string; index: number }> = React.memo(
   );
 });
 
+const RESUMO_MAX_MINIATURAS = 5;
+
+// Resumo único das fotos do serviço: poucas miniaturas e o total. Não separa por campo, para a
+// lista continuar leve com muitos serviços. A foto inteira abre ampliada e pode ser baixada.
+const LegacyPhotoSummary: React.FC<{ refs: unknown[]; resolved: Record<string, string> }> = React.memo(({ refs, resolved }) => {
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const [viewerIndex, setViewerIndex] = useState(0);
+  const fotos = useMemo(() => {
+    const out: FotoInfo[] = [];
+    for (const item of refs as any[]) {
+      const direto = resolvePhotoItem(item);
+      if (direto) { out.push(direto); continue; }
+      const id = typeof item === 'string' ? item : item && typeof item.id === 'string' ? item.id : null;
+      const uri = id ? resolved[id] : null;
+      if (uri) out.push(/^https?:\/\//i.test(uri) ? ({ url: uri } as FotoInfo) : ({ uri } as FotoInfo));
+    }
+    return out;
+  }, [refs, resolved]);
+
+  const total = refs.length;
+  if (total === 0) return null;
+  const visiveis = fotos.slice(0, RESUMO_MAX_MINIATURAS);
+  const restantes = total - visiveis.length;
+
+  return (
+    <View style={styles.stripWrap}>
+      <Text style={styles.stripLabel}>{total} {total === 1 ? 'foto' : 'fotos'}</Text>
+      {visiveis.length > 0 ? (
+        <View style={styles.stripRow}>
+          {visiveis.map((foto, idx) => {
+            const uri = foto.url || foto.uri;
+            const ultima = idx === visiveis.length - 1 && restantes > 0;
+            return (
+              <TouchableOpacity
+                key={`${idx}-${uri}`}
+                style={styles.stripThumb}
+                activeOpacity={0.85}
+                onPress={() => { setViewerIndex(idx); setViewerOpen(true); }}
+              >
+                {uri ? <LazyThumbnailImage uri={uri} index={idx} /> : null}
+                {ultima && (
+                  <View style={styles.stripMais}>
+                    <Text style={styles.stripMaisTexto}>+{restantes}</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      ) : (
+        <Text style={styles.stripEmpty}>Fotos ainda não disponíveis neste aparelho</Text>
+      )}
+      <PhotoViewerModal photos={fotos} initialIndex={viewerIndex} visible={viewerOpen} onClose={() => setViewerOpen(false)} />
+    </View>
+  );
+});
+
 const ServiceCardComponent: React.FC<ServiceCardProps> = ({
   service,
   isExpanded,
@@ -833,6 +895,52 @@ const ServiceCardComponent: React.FC<ServiceCardProps> = ({
     () => (isLegacyFlow && dataExists ? collectLegacySimpleSummary(summarySource, service.tipo_servico) : []),
     [dataExists, isLegacyFlow, service.tipo_servico, summarySource]
   );
+  // Fotos antigas guardam só o id; resolve para um endereço de imagem (arquivo local ou URL enviada).
+  const [fotoUris, setFotoUris] = useState<Record<string, string>>({});
+  const idsDeFotos = useMemo(() => {
+    const ids = new Set<string>();
+    const coletar = (lista: unknown) => {
+      if (!Array.isArray(lista)) return;
+      for (const it of lista as any[]) {
+        const id = typeof it === 'string' ? it : it && typeof it.id === 'string' ? it.id : null;
+        if (id && !/^(https?:|file:|content:|\/)/i.test(id)) ids.add(id);
+      }
+    };
+    legacyMediaSummary.forEach((m) => coletar((summarySource as any)[m.key]));
+    const postesBrutos = service.tipo_servico === CHECKLIST_TIPO ? (summarySource as any).checklist_postes_data : (summarySource as any).postes_data;
+    legacyPostesSummary.forEach((p) => p.sections.forEach((sec) => coletar(sec.photos)));
+    void postesBrutos;
+    return Array.from(ids);
+  }, [legacyMediaSummary, legacyPostesSummary, summarySource, service.tipo_servico]);
+
+  const todasAsFotos = useMemo(() => {
+    const out: unknown[] = [];
+    legacyMediaSummary.forEach((m) => {
+      if (m.kind !== 'foto') return;
+      const lista = (summarySource as any)[m.key];
+      if (Array.isArray(lista)) out.push(...lista);
+    });
+    legacyPostesSummary.forEach((p) => p.sections.forEach((sec) => out.push(...sec.photos)));
+    return out;
+  }, [legacyMediaSummary, legacyPostesSummary, summarySource]);
+
+  useEffect(() => {
+    if (!isExpanded || idsDeFotos.length === 0) return;
+    let ativo = true;
+    getPhotoMetadatasByIds(idsDeFotos)
+      .then((metas) => {
+        if (!ativo) return;
+        const mapa: Record<string, string> = {};
+        for (const m of metas) {
+          const uri = m.supabaseUrl || m.uploadUrl || m.compressedPath || m.backupPath || m.originalUri;
+          if (uri) mapa[m.id] = uri;
+        }
+        setFotoUris(mapa);
+      })
+      .catch(() => {});
+    return () => { ativo = false; };
+  }, [isExpanded, idsDeFotos]);
+
   const createdAtLabel = useMemo(() => {
     const rawCreatedAt = String(service.created_at || '').trim();
     if (!rawCreatedAt) return '';
@@ -905,11 +1013,12 @@ const ServiceCardComponent: React.FC<ServiceCardProps> = ({
               {/* Midias com registro */}
               {legacyMediaSummary.length > 0 && (
                 <View style={styles.summaryGroup}>
-                  <Text style={styles.summaryGroupLabel}>Formulario preenchido</Text>
-                  {legacyMediaSummary.map((item) => (
-                    <View key={item.key} style={[styles.summaryRow, styles.summaryRowDone]}>
-                      <Text style={[styles.summaryRowLabel, styles.summaryRowLabelDone]}>{item.label}</Text>
-                      <Text style={[styles.summaryRowValue, styles.summaryRowValueDone]}>{formatLegacyItemCount(item)}</Text>
+                  <Text style={styles.summaryGroupLabel}>Fotos</Text>
+                  <LegacyPhotoSummary refs={todasAsFotos} resolved={fotoUris} />
+                  {legacyMediaSummary.filter((item) => item.kind !== 'foto').map((item) => (
+                    <View key={item.key} style={styles.summaryRow}>
+                      <Text style={styles.summaryRowLabel}>{item.label}</Text>
+                      <Text style={styles.summaryRowValue}>{formatLegacyItemCount(item)}</Text>
                     </View>
                   ))}
                 </View>
@@ -950,14 +1059,7 @@ const ServiceCardComponent: React.FC<ServiceCardProps> = ({
                           Faltando: {poste.missingRequirements.join(', ')}
                         </Text>
                       )}
-                      {poste.sections.map((section) => (
-                        <View key={`${poste.key}-${section.key}`} style={[styles.summarySubRow, styles.summarySubRowDone]}>
-                          <Text style={[styles.summarySubLabel, styles.summarySubLabelDone]}>{section.label}</Text>
-                          <Text style={[styles.summarySubValue, styles.summarySubValueDone]}>
-                            {section.count === 1 ? '1 foto' : `${section.count} fotos`}
-                          </Text>
-                        </View>
-                      ))}
+
                     </View>
                   ))}
                 </View>
@@ -1014,7 +1116,7 @@ const ServiceCardComponent: React.FC<ServiceCardProps> = ({
                 )}
                 {onOpenDetails && (
                   <TouchableOpacity style={[styles.actionBtn, styles.legacyBtn]} onPress={onOpenDetails}>
-                    <Ionicons name="create-outline" size={16} color="#1D4ED8" />
+                    <Ionicons name="create-outline" size={16} color="#B91C1C" />
                     <Text style={styles.legacyBtnText}>Editar no formulário</Text>
                   </TouchableOpacity>
                 )}
@@ -1348,6 +1450,30 @@ const PhotoViewerModal: React.FC<PhotoViewerModalProps> = ({ photos, initialInde
     })
   ).current;
 
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const handleSave = async () => {
+    const atual = photos[currentIndex];
+    const alvo = atual?.uri || atual?.url;
+    if (!alvo || saving) return;
+    setSaving(true);
+    try {
+      let local = alvo;
+      if (/^https?:\/\//i.test(alvo)) {
+        const destino = `${FileSystem.cacheDirectory}foto_${Date.now()}.jpg`;
+        const baixado = await FileSystem.downloadAsync(alvo, destino);
+        local = baixado.uri;
+      }
+      const ok = await savePhotoToGallery(local);
+      setSaveMsg(ok ? 'Foto salva na galeria' : 'Não foi possível salvar');
+    } catch {
+      setSaveMsg('Não foi possível salvar');
+    } finally {
+      setSaving(false);
+      setTimeout(() => setSaveMsg(null), 2000);
+    }
+  };
+
   const photo = photos[currentIndex];
   // Prefere a URL pública (Supabase) sobre o URI local.
   // O arquivo local é deletado após o sync bem-sucedido; usar url evita o erro
@@ -1362,10 +1488,18 @@ const PhotoViewerModal: React.FC<PhotoViewerModalProps> = ({ photos, initialInde
           {photos.length > 1 && (
             <Text style={viewerStyles.counterText}>{currentIndex + 1} / {photos.length}</Text>
           )}
-          <TouchableOpacity style={viewerStyles.closeBtn} onPress={onClose}>
+          <TouchableOpacity style={viewerStyles.closeBtn} onPress={handleSave} accessibilityLabel="Baixar foto">
+            {saving ? <ActivityIndicator size="small" color="#FFF" /> : <Ionicons name="download-outline" size={24} color="#FFF" />}
+          </TouchableOpacity>
+          <TouchableOpacity style={[viewerStyles.closeBtn, { marginLeft: 10 }]} onPress={onClose} accessibilityLabel="Fechar">
             <Ionicons name="close" size={26} color="#FFF" />
           </TouchableOpacity>
         </View>
+        {saveMsg && (
+          <View style={viewerStyles.saveToast}>
+            <Text style={viewerStyles.saveToastText}>{saveMsg}</Text>
+          </View>
+        )}
 
         <Text style={viewerStyles.hint}>Pinça para zoom · Duplo toque para ampliar</Text>
 
@@ -1442,6 +1576,8 @@ const viewerStyles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
   },
+  saveToast: { position: 'absolute', bottom: 110, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.7)', borderRadius: 18, paddingHorizontal: 14, paddingVertical: 8, zIndex: 20 },
+  saveToastText: { color: '#FFF', fontSize: 13, fontWeight: '600' },
   closeBtn: {
     marginLeft: 'auto' as any,
     padding: 8,
@@ -1936,9 +2072,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: spacing.xs,
-    backgroundColor: '#EFF6FF',
+    backgroundColor: '#FEF2F2',
     borderWidth: 1,
-    borderColor: '#BFDBFE',
+    borderColor: '#FECACA',
     borderRadius: 8,
     paddingHorizontal: spacing.sm,
     paddingVertical: spacing.sm,
@@ -1947,7 +2083,7 @@ const styles = StyleSheet.create({
   legacyBannerText: {
     flex: 1,
     fontSize: 12,
-    color: '#1E3A8A',
+    color: '#7F1D1D',
     fontWeight: '600',
     lineHeight: 17,
   },
@@ -1955,9 +2091,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: spacing.sm,
-    backgroundColor: '#EFF6FF',
+    backgroundColor: '#FEF2F2',
     borderWidth: 1,
-    borderColor: '#BFDBFE',
+    borderColor: '#FECACA',
     borderRadius: 10,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
@@ -1966,18 +2102,18 @@ const styles = StyleSheet.create({
   legacyInlineBannerTitle: {
     fontSize: 13,
     fontWeight: '800',
-    color: '#1E3A8A',
+    color: '#7F1D1D',
   },
   legacyInlineBannerSub: {
     fontSize: 11,
-    color: '#3B82F6',
+    color: '#EF4444',
     fontWeight: '600',
     marginTop: 1,
   },
   legacyBtn: {
-    backgroundColor: '#EFF6FF',
+    backgroundColor: '#FEF2F2',
     borderWidth: 1,
-    borderColor: '#BFDBFE',
+    borderColor: '#FECACA',
     borderRadius: 8,
     paddingVertical: spacing.sm,
     paddingHorizontal: spacing.md,
@@ -1988,7 +2124,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   legacyBtnText: {
-    color: '#1D4ED8',
+    color: '#B91C1C',
     fontWeight: '700',
     fontSize: 13,
   },
@@ -2164,6 +2300,15 @@ const styles = StyleSheet.create({
     backgroundColor: colors.bgTertiary,
     position: 'relative',
   },
+  stripWrap: { marginTop: 8 },
+  stripHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
+  stripLabel: { fontSize: 13, fontWeight: '600', color: '#374151', marginBottom: 6 },
+  stripCount: { fontSize: 12, fontWeight: '700', color: '#6B7280' },
+  stripRow: { flexDirection: 'row', gap: 8 },
+  stripMais: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(17,24,39,0.55)', alignItems: 'center', justifyContent: 'center' },
+  stripMaisTexto: { color: '#FFFFFF', fontSize: 16, fontWeight: '700' },
+  stripThumb: { width: 60, height: 60, borderRadius: 10, overflow: 'hidden', backgroundColor: '#F3F4F6' },
+  stripEmpty: { fontSize: 12, color: '#9CA3AF' },
   photoImage: {
     width: '100%',
     height: '100%',
@@ -2324,7 +2469,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row' as const,
     alignItems: 'center' as const,
     gap: 6,
-    backgroundColor: '#1D4ED8',
+    backgroundColor: '#B91C1C',
     borderRadius: 8,
     paddingHorizontal: 16,
     paddingVertical: 10,
@@ -2374,17 +2519,17 @@ const styles = StyleSheet.create({
     fontWeight: '500' as const,
   },
   summaryRowDone: {
-    backgroundColor: '#ECFDF5',
-    borderBottomColor: '#A7F3D0',
+    backgroundColor: 'transparent',
+    borderBottomColor: '#E5E7EB',
     borderRadius: 6,
     paddingHorizontal: 8,
   },
   summaryRowLabelDone: {
-    color: '#166534',
+    color: '#374151',
     fontWeight: '600' as const,
   },
   summaryRowValueDone: {
-    color: '#166534',
+    color: '#374151',
     fontWeight: '700' as const,
   },
   posteSummaryCard: {
@@ -2443,17 +2588,17 @@ const styles = StyleSheet.create({
     fontWeight: '500' as const,
   },
   summarySubRowDone: {
-    backgroundColor: '#ECFDF5',
+    backgroundColor: 'transparent',
     borderRadius: 6,
     paddingHorizontal: 8,
     marginTop: 2,
   },
   summarySubLabelDone: {
-    color: '#166534',
+    color: '#374151',
     fontWeight: '600' as const,
   },
   summarySubValueDone: {
-    color: '#166534',
+    color: '#374151',
     fontWeight: '700' as const,
   },
   legacySummaryActions: {

@@ -1,21 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { updateAdminUser, changeAdminUserPassword, deleteAdminUser } from '@/lib/supabase-admin'
-<<<<<<< HEAD
-=======
 import { requireAdmin } from '@/lib/api-auth'
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
 
 // PUT: Atualizar usuário admin
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-<<<<<<< HEAD
-=======
   const auth = await requireAdmin(request)
   if (auth.error) return auth.error
 
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
   try {
     const body = await request.json()
     const { full_name, role, password } = body
@@ -49,12 +43,9 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-<<<<<<< HEAD
-=======
   const auth = await requireAdmin(request)
   if (auth.error) return auth.error
 
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
   try {
     const { id: userId } = await params
     await deleteAdminUser(userId)

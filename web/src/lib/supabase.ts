@@ -111,7 +111,8 @@ export interface Obra {
   doc_autorizacao_passagem?: FotoInfo[]
   doc_materiais_previsto?: FotoInfo[]
   doc_materiais_realizado?: FotoInfo[]
-  user_id: string
+  // Login por equipe no mobile não usa Supabase Auth: obras sincronizadas chegam com user_id nulo.
+  user_id?: string | null
   created_at: string
 }
 

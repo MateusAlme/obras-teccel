@@ -482,10 +482,12 @@ const uploadPhotoToSupabase = async (
     const contentType = photoMetadata.mimeType || 'image/jpeg';
     const fileExt = contentType === 'application/pdf' ? 'pdf' : 'jpg';
 
-    // Criar nome único do arquivo com timestamp e random ID para evitar conflitos
-    const timestamp = Date.now();
-    const randomId = Math.random().toString(36).substr(2, 9);
-    const fileName = `${photoMetadata.type}_${timestamp}_${randomId}_${photoMetadata.index}.${fileExt}`;
+    // Nome FIXO por foto (derivado do id). Antes levava timestamp e número aleatório, então um
+    // reenvio (timeout com o primeiro upload já concluído, duas filas ao mesmo tempo) criava um
+    // segundo arquivo com outra URL e a foto aparecia duplicada no web. Com nome fixo, o reenvio
+    // sobrescreve o mesmo objeto (x-upsert) e a URL é sempre a mesma.
+    const idSeguro = String(photoMetadata.id).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const fileName = `${photoMetadata.type}_${idSeguro}.${fileExt}`;
     // Usar obraId como pasta para organizar as fotos
     const filePath = `${folderName}/${fileName}`;
 

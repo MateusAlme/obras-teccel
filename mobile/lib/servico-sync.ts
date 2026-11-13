@@ -609,6 +609,22 @@ export async function saveServicoLocal(servico: ServicoLocal): Promise<void> {
  *  - objeto { id, uri, ... } (formato novo  salvo apos a corre?fAaAaaAaAaAaaAAAAaAaaAAAasAAaAA?f??s?,?o de appendPhotoToServicoLocal)
  * Itens que ja possuem { url } so retornados sem altera?fAaAaaAaAaAaaAAAAaAaaAAAasAAaAA?f??s?,?o.
  */
+/** Remove foto repetida (mesma URL ou mesmo id) mantendo a ordem e a primeira ocorrência. */
+function removerFotosRepetidas(lista: any[]): any[] {
+  if (!Array.isArray(lista) || lista.length < 2) return lista;
+  const vistos = new Set<string>();
+  const saida: any[] = [];
+  for (const item of lista) {
+    const chave = typeof item === 'string'
+      ? item
+      : String(item?.url || item?.id || item?.photoId || item?.uri || JSON.stringify(item));
+    if (vistos.has(chave)) continue;
+    vistos.add(chave);
+    saida.push(item);
+  }
+  return saida;
+}
+
 async function resolveLocalPhotosToUrls(
   fotosField: any[],
   obraId: string
@@ -761,7 +777,7 @@ async function resolveNestedServicoPhotosToUrls(servicoLocal: ServicoLocal, obra
   // Preserva fotos com URI mesmo se upload falhar — elas ainda podem ser exibidas offline
   const resolveArrayFieldPreservingLocal = async (value: any) => {
     if (!Array.isArray(value)) return value;
-    const resolved = await resolveLocalPhotosToUrls(value, obraId);
+    const resolved = removerFotosRepetidas(await resolveLocalPhotosToUrls(value, obraId));
     // Se a resolução retornou vazio, significa upload falhou - manter original com URI
     if (Array.isArray(resolved) && resolved.length === 0 && value.length > 0) {
       logger.warn(`[resolveNestedServicoPhotosToUrls] Upload falhou, mantendo fotos com URI local`);
@@ -1577,7 +1593,7 @@ export async function syncServico(servicoLocal: ServicoLocal): Promise<{
     const resolvedEntries = await Promise.all(
       fotosDocKeys.map(async (key) => [
         key,
-        await resolveLocalPhotosToUrls((servicoLocal as any)[key] || [], obraId),
+        removerFotosRepetidas(await resolveLocalPhotosToUrls((servicoLocal as any)[key] || [], obraId)),
       ])
     );
     const resolvedFotos: Record<string, any[]> = Object.fromEntries(resolvedEntries);

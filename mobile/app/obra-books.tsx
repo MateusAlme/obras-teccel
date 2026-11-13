@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import { converterObraLegadaEmServico, tipoPodeConverterObraLegada } from '../lib/converter-obra-legada';
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, ActivityIndicator, LayoutAnimation, Platform, UIManager, Modal, Image, Animated, TextInput, KeyboardAvoidingView, Keyboard } from 'react-native';
 import { useLocalSearchParams, useRouter, useFocusEffect } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -1424,9 +1425,54 @@ export default function ObraBooksPage() {
     await loadData({ showSpinner: false });
   };
 
+  // Obra legada de tipo simples vira serviço do padrão novo na primeira edição (conversão sob demanda).
+  const converterLegadoEAbrirCaptura = async (servico: Servico, category: keyof Servico): Promise<boolean> => {
+    const obraLegada = obras.find((item) => item.id === servico.obra_id);
+    if (!obraLegada || !tipoPodeConverterObraLegada(obraLegada.tipo_servico)) return false;
+    try {
+      const r = await converterObraLegadaEmServico(obraLegada as any);
+      if (!r.ok) {
+        console.warn('[obra-books] conversão da obra legada não feita:', (r as any).motivo);
+        return false;
+      }
+      await loadData({ showSpinner: false });
+      openServicoPhotoCapture(r.servico as unknown as Servico, category);
+      return true;
+    } catch (error) {
+      console.warn('[obra-books] erro ao converter obra legada:', error);
+      return false;
+    }
+  };
+
+  // "Editar" numa obra antiga de tipo simples: converte para o padrão novo e abre o mesmo cartão
+  // dos demais serviços, em vez de mandar para o formulário antigo (duas telas para a mesma coisa).
+  const converterLegadoEExpandir = async (servico: Servico): Promise<boolean> => {
+    const obraLegada = obras.find((item) => item.id === servico.obra_id);
+    if (!obraLegada || !tipoPodeConverterObraLegada(obraLegada.tipo_servico)) return false;
+    try {
+      const r = await converterObraLegadaEmServico(obraLegada as any);
+      if (!r.ok) {
+        console.warn('[obra-books] conversão da obra legada não feita:', (r as any).motivo);
+        return false;
+      }
+      await loadData({ showSpinner: false });
+      setExpandedServicoId(r.servico.id);
+      return true;
+    } catch (error) {
+      console.warn('[obra-books] erro ao converter obra legada:', error);
+      return false;
+    }
+  };
+
   const handleCapturePhoto = (servico: Servico, category: keyof Servico) => {
     if (servico.id.startsWith('legacy-')) {
       const obraLegada = obras.find((item) => item.id === servico.obra_id);
+      if (obraLegada && tipoPodeConverterObraLegada(obraLegada.tipo_servico)) {
+        void converterLegadoEAbrirCaptura(servico, category).then((ok) => {
+          if (!ok) handleOpenLegacyObraEditor(obraLegada);
+        });
+        return;
+      }
       if (obraLegada) {
         handleOpenLegacyObraEditor(obraLegada);
       } else {
@@ -1441,6 +1487,12 @@ export default function ObraBooksPage() {
   const openServicoPhotoCapture = (servico: Servico, category: keyof Servico) => {
     if (servico.id.startsWith('legacy-')) {
       const obraLegada = obras.find((item) => item.id === servico.obra_id);
+      if (obraLegada && tipoPodeConverterObraLegada(obraLegada.tipo_servico)) {
+        void converterLegadoEAbrirCaptura(servico, category).then((ok) => {
+          if (!ok) handleOpenLegacyObraEditor(obraLegada);
+        });
+        return;
+      }
       if (obraLegada) {
         handleOpenLegacyObraEditor(obraLegada);
       } else {
@@ -2517,11 +2569,23 @@ export default function ObraBooksPage() {
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.container}>
         <View style={styles.header}>
-          <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
-            <Text style={styles.backButtonText}>Voltar</Text>
-          </TouchableOpacity>
-          <Text style={styles.title}>Obra {obraNumero}</Text>
-          <Text style={styles.subtitle}>Books e serviços em sequência</Text>
+          <View style={styles.headerRow}>
+            <TouchableOpacity
+              style={styles.backButton}
+              onPress={() => router.back()}
+              accessibilityLabel="Voltar"
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Ionicons name="arrow-back" size={22} color="#111827" />
+            </TouchableOpacity>
+            <View style={styles.headerTextos}>
+              <Text style={styles.title} numberOfLines={1}>Obra {obraNumero}</Text>
+              <Text style={styles.subtitle}>
+                {allServicos.length} {allServicos.length === 1 ? 'serviço' : 'serviços'}
+                {` · ${allServicos.filter((sv) => sv.status === 'completo').length} concluído(s)`}
+              </Text>
+            </View>
+          </View>
         </View>
 
         {!isOnline && (
@@ -2553,11 +2617,13 @@ export default function ObraBooksPage() {
           )}
         </View>
 
-        <View style={styles.filtersWrapper}>
-          {filterButton('todos', 'Todos')}
-          {filterButton('andamento', 'Em andamento')}
-          {filterButton('concluidos', 'Concluídos')}
-          {filterButton('pendentes', 'Sem foto')}
+        <View style={{ flexGrow: 0 }}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filtersWrapper}>
+            {filterButton('todos', 'Todos')}
+            {filterButton('andamento', 'Em andamento')}
+            {filterButton('concluidos', 'Concluídos')}
+            {filterButton('pendentes', 'Sem foto')}
+          </ScrollView>
         </View>
 
         {createdServiceToast && (
@@ -2567,7 +2633,7 @@ export default function ObraBooksPage() {
         )}
 
         {loading ? (
-          <View style={styles.centered}><ActivityIndicator size="large" color="#1d4ed8" /></View>
+          <View style={styles.centered}><ActivityIndicator size="large" color="#DC2626" /></View>
         ) : (
           <ScrollView
             ref={listScrollRef}
@@ -2636,6 +2702,12 @@ export default function ObraBooksPage() {
                       onOpenDetails={
                         () => {
                           if (isLegacyFlow) {
+                            if (servico.id.startsWith('legacy-')) {
+                              void converterLegadoEExpandir(servico).then((ok) => {
+                                if (!ok) openLegacyServicoDetalhe(servico, undefined, legacyObra, scopedLegacyData);
+                              });
+                              return;
+                            }
                             openLegacyServicoDetalhe(servico, undefined, legacyObra, scopedLegacyData);
                             return;
                           }
@@ -2748,7 +2820,7 @@ export default function ObraBooksPage() {
                           <Text style={[styles.equipePickerItemText, selected && styles.equipePickerItemTextSelected]}>
                             {item}
                           </Text>
-                          {selected && <Ionicons name="checkmark-circle" size={18} color="#2563EB" />}
+                          {selected && <Ionicons name="checkmark-circle" size={18} color="#DC2626" />}
                         </TouchableOpacity>
                       );
                     })}
@@ -3051,8 +3123,8 @@ export default function ObraBooksPage() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: '#eef2f6' },
-  container: { flex: 1, backgroundColor: '#eef2f6' },
+  safeArea: { flex: 1, backgroundColor: '#F3F4F6' },
+  container: { flex: 1, backgroundColor: '#F3F4F6' },
   offlineBanner: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -3093,19 +3165,20 @@ const styles = StyleSheet.create({
   successTitle: { fontSize: 24, fontWeight: '800', color: '#059669', marginBottom: 6 },
   successSub: { fontSize: 14, color: '#6B7280', textAlign: 'center', maxWidth: 200 },
   header: { paddingHorizontal: 14, paddingTop: 6, paddingBottom: 6 },
-  backButton: { alignSelf: 'flex-start', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#dbeafe', marginBottom: 8 },
-  backButtonText: { color: '#1e40af', fontWeight: '700' },
+  headerRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  headerTextos: { flex: 1 },
+  backButton: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#ffffff', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#E5E7EB' },
   title: { fontSize: 24, fontWeight: '800', color: '#111827' },
   subtitle: { fontSize: 12, color: '#6b7280', marginTop: 1 },
   topActions: { paddingHorizontal: 14, paddingBottom: 6 },
-  primaryAction: { backgroundColor: '#0b57d0', borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
+  primaryAction: { backgroundColor: '#DC2626', borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
   primaryActionText: { color: '#fff', fontWeight: '700', fontSize: 16 },
-  secondaryAction: { backgroundColor: '#0f766e', borderRadius: 10, paddingVertical: 9, alignItems: 'center', marginTop: 6 },
+  secondaryAction: { backgroundColor: '#374151', borderRadius: 10, paddingVertical: 9, alignItems: 'center', marginTop: 6 },
   secondaryActionDisabled: { backgroundColor: '#94a3b8' },
   secondaryActionText: { color: '#fff', fontWeight: '700', fontSize: 14 },
-  filtersWrapper: { paddingHorizontal: 14, flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12, marginBottom: 12 },
-  filterChip: { height: 36, paddingHorizontal: 14, borderRadius: 999, backgroundColor: '#e5e7eb', justifyContent: 'center', alignItems: 'center' },
-  filterChipActive: { backgroundColor: '#1d4ed8' },
+  filtersWrapper: { paddingHorizontal: 14, gap: 8, marginTop: 12, marginBottom: 12, alignItems: 'center' },
+  filterChip: { height: 34, paddingHorizontal: 14, borderRadius: 999, backgroundColor: '#ffffff', borderWidth: 1, borderColor: '#E5E7EB', justifyContent: 'center', alignItems: 'center' },
+  filterChipActive: { backgroundColor: '#DC2626' },
   filterChipText: { color: '#334155', fontWeight: '600' },
   filterChipTextActive: { color: '#fff' },
   listScroll: { flex: 1 },
@@ -3115,8 +3188,8 @@ const styles = StyleSheet.create({
   serviceItemNewlyCreated: {
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#22c55e',
-    backgroundColor: '#f0fdf4',
+    borderColor: '#DC2626',
+    backgroundColor: '#FEF2F2',
     padding: 2,
   },
   createdToast: {
@@ -3127,7 +3200,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
     borderWidth: 1,
-    borderColor: '#1d4ed8',
+    borderColor: '#DC2626',
     shadowColor: '#000',
     shadowOpacity: 0.15,
     shadowRadius: 8,
@@ -3203,8 +3276,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   modeChipActive: {
-    backgroundColor: '#dbeafe',
-    borderColor: '#1d4ed8',
+    backgroundColor: '#FEE2E2',
+    borderColor: '#DC2626',
   },
   modeChipText: {
     fontSize: 12,
@@ -3212,7 +3285,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   modeChipTextActive: {
-    color: '#1d4ed8',
+    color: '#DC2626',
   },
   modeHintText: {
     color: '#92400E',
@@ -3264,7 +3337,7 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
   },
   pointsAddButtonText: {
-    color: '#1d4ed8',
+    color: '#DC2626',
     fontSize: 12,
     fontWeight: '700',
   },
@@ -3321,10 +3394,10 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   detailsSaveButton: {
-    backgroundColor: '#1d4ed8',
+    backgroundColor: '#DC2626',
   },
   detailsSaveButtonDisabled: {
-    backgroundColor: '#93c5fd',
+    backgroundColor: '#FCA5A5',
   },
   detailsSaveButtonText: {
     color: '#fff',
@@ -3497,7 +3570,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
   },
   equipePickerItemSelected: {
-    backgroundColor: '#EFF6FF', borderRadius: 10,
+    backgroundColor: '#FEF2F2', borderRadius: 10,
     paddingHorizontal: 10, marginHorizontal: -4,
   },
   equipePickerDot: {
@@ -3506,7 +3579,7 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   equipePickerDotSelected: {
-    borderColor: '#2563EB', backgroundColor: '#2563EB',
+    borderColor: '#DC2626', backgroundColor: '#DC2626',
   },
   equipePickerDotInner: {
     width: 8, height: 8, borderRadius: 4, backgroundColor: '#FFF',
@@ -3515,6 +3588,6 @@ const styles = StyleSheet.create({
     flex: 1, fontSize: 15, fontWeight: '500', color: '#1E293B',
   },
   equipePickerItemTextSelected: {
-    color: '#1E40AF', fontWeight: '700',
+    color: '#991B1B', fontWeight: '700',
   },
 });

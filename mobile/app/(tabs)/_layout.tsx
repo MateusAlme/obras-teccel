@@ -12,6 +12,7 @@ export default function TabLayout() {
     <Tabs
       screenOptions={{
         headerShown: true,
+        headerTitleStyle: { fontWeight: '800', fontSize: 20, color: '#111827' },
         tabBarActiveTintColor: '#dc3545',
         tabBarInactiveTintColor: '#6b7280',
         tabBarStyle: {
@@ -56,20 +57,6 @@ export default function TabLayout() {
           tabBarIcon: ({ color, focused }) => (
             <Ionicons
               name={focused ? 'construct' : 'construct-outline'}
-              size={24}
-              color={color}
-            />
-          ),
-        }}
-      />
-      <Tabs.Screen
-        name="profile"
-        options={{
-          title: 'Perfil',
-          tabBarLabel: 'Perfil',
-          tabBarIcon: ({ color, focused }) => (
-            <Ionicons
-              name={focused ? 'person' : 'person-outline'}
               size={24}
               color={color}
             />

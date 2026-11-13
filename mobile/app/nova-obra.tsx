@@ -42,11 +42,13 @@ import {
   getPhotoMetadatasByIds,
   updatePhotosObraId,
 } from '../lib/photo-backup';
+import { registrarIntencaoCamera, limparIntencaoCamera } from '../lib/camera-recovery';
 import { processObraPhotos, addToUploadQueue } from '../lib/photo-queue';
 import { PlacaScanner } from '../components/PlacaScanner';
 import type { PlacaInfo } from '../lib/placa-parser';
 import { PhotoWithPlaca } from '../components/PhotoWithPlaca';
 import { renderPhotoWithPlacaBurnedIn } from '../lib/photo-with-placa';
+import { theme } from '../theme';
 import { useToast } from '../components/Toast';
 import { isCompressorProfile, isLinhaVivaProfile, isAdminOrSupervisor } from '../lib/profile-rules';
 // Import dinâmico (lazy) para evitar erro no web
@@ -1106,6 +1108,19 @@ export default function NovaObra() {
   useEffect(() => {
     autoSaveRef.current = performAutoSave;
   }, [performAutoSave]);
+
+  // ✅ AUTO-SAVE APÓS CADA MUDANÇA: 1,5 s depois da última alteração (foto, campo, poste).
+  // O salvamento só por tempo (2 min) e ao ir para segundo plano deixava uma janela em que fechar
+  // o app, ou o Android matá-lo, perdia o que foi feito. performAutoSave muda de identidade a cada
+  // alteração de estado, então este efeito dispara a cada mudança e o timer reinicia (debounce).
+  useEffect(() => {
+    if (!autoSaveEnabled) return;
+    const timer = setTimeout(() => {
+      autoSaveRef.current?.().catch((error) => console.error('❌ Erro no auto-save pós-alteração:', error));
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [performAutoSave, autoSaveEnabled]);
+
 
   // Evita reaproveitar serverId de uma edição anterior ao iniciar novo book.
   useEffect(() => {
@@ -2246,9 +2261,16 @@ export default function NovaObra() {
       // Iniciar GPS em paralelo com a câmera
       const locationPromise = getCurrentLocation();
 
+      if (source === 'camera') {
+        const posteIntencao = postesData.find(p => p.id === posteId);
+        const baseIntencao = ({ fotosAntes: 'antes', fotosDurante: 'durante', fotosDepois: 'depois', fotosMedicao: 'aterramento_medicao' } as const)[secao];
+        const idIntencao = posteIntencao ? getPosteIdPersistencia(posteIntencao) : String(posteId || '').trim();
+        await registrarIntencaoCamera(backupObraId, `${baseIntencao}_${idIntencao}`, posteIntencao ? posteIntencao[secao].length : 0);
+      }
       const result = source === 'camera'
         ? await ImagePicker.launchCameraAsync(pickerOptions)
         : await ImagePicker.launchImageLibraryAsync(pickerOptions);
+      void limparIntencaoCamera();
 
       if (result.canceled) {
         setUploadingPhoto(false);
@@ -2439,9 +2461,11 @@ export default function NovaObra() {
         ? Promise.resolve({ latitude: null, longitude: null })
         : getCurrentLocation();
 
+      if (source === 'camera') await registrarIntencaoCamera(backupObraId, String(tipo), 0);
       const result = source === 'camera'
         ? await ImagePicker.launchCameraAsync(pickerOptions)
         : await ImagePicker.launchImageLibraryAsync(pickerOptions);
+      void limparIntencaoCamera();
 
       if (result.canceled) {
         setUploadingPhoto(false);
@@ -2844,13 +2868,10 @@ export default function NovaObra() {
         setDocAutorizacaoPassagem(prev => [...prev, photoData]);
       }
 
-      // Feedback silencioso via toast (sem pop-up)
-      showToast(
-        photoMetadata.utmX && photoMetadata.utmY
-          ? '📍 Foto salva com localização'
-          : '📷 Foto salva',
-        'success'
-      );
+      // Foto salva já aparece como miniatura; só avisa quando falta a localização.
+      if (!(photoMetadata.utmX && photoMetadata.utmY)) {
+        showToast('Foto salva sem localização GPS', 'warning');
+      }
 
     } catch (error: any) {
       // PROTEÇÃO ROBUSTA contra crashes
@@ -3108,7 +3129,7 @@ export default function NovaObra() {
     setPendingPhoto(null);
     setShowPlacaOverlay(false);
 
-    Alert.alert('✅ Foto salva!', 'Foto registrada com localização e dados da obra.');
+    Alert.alert('Foto salva', 'Foto registrada com localização e dados da obra.');
   };
 
   // Refazer foto - chama takePicture novamente
@@ -3581,29 +3602,35 @@ export default function NovaObra() {
   };
 
   const handleSalvarObra = async () => {
+    // Foto ainda sendo processada (backup e compressão): salvar agora gravaria a obra sem ela e a
+    // foto ficaria órfã no backup. Os botões de foto já respeitam isso; o salvar também deve.
+    if (uploadingPhoto) {
+      showToast('Aguarde a foto terminar de salvar', 'info');
+      return;
+    }
     // ===== VALIDAÇÕES BÁSICAS OBRIGATÓRIAS (SEMPRE) =====
 
     // 1. Data da obra
     if (!data) {
-      Alert.alert('❌ Campo Obrigatório', 'Selecione a data da obra');
+      Alert.alert('Campo Obrigatório', 'Selecione a data da obra');
       return;
     }
 
     // 2. Número da obra
     if (!obra || obra.trim() === '') {
-      Alert.alert('❌ Campo Obrigatório', 'Digite o número da obra');
+      Alert.alert('Campo Obrigatório', 'Digite o número da obra');
       return;
     }
 
     // 3. Responsável (Encarregado)
     if (!responsavel || responsavel.trim() === '') {
-      Alert.alert('❌ Campo Obrigatório', 'Digite o nome do encarregado/responsável');
+      Alert.alert('Campo Obrigatório', 'Digite o nome do encarregado/responsável');
       return;
     }
 
     // 4. Tipo de Serviço
     if (!tipoServico) {
-      Alert.alert('❌ Campo Obrigatório', 'Selecione o tipo de serviço');
+      Alert.alert('Campo Obrigatório', 'Selecione o tipo de serviço');
       return;
     }
 
@@ -3671,7 +3698,7 @@ export default function NovaObra() {
       const obraSemelhante = await findSimilarOpenObra(obraNumero, tipoServico);
       if (obraSemelhante) {
         Alert.alert(
-          '⚠️ Obra Semelhante Encontrada',
+          'Obra Semelhante Encontrada',
           `Já existe uma obra "${tipoServico}" com o número ${obraNumero} em andamento.\n\nDeseja continuar de onde parou ou abrir uma nova obra?`,
           [
             {
@@ -3706,7 +3733,7 @@ export default function NovaObra() {
       // ⚡ LAUDO TRANSFORMADOR - OBRIGATÓRIO quando Transformador (exceto Documentação)
       if (isServicoTransformador && !isServicoDocumentacao && docLaudoTransformador.length === 0) {
         Alert.alert(
-          '⚡ Laudo de Transformador Obrigatório',
+          'Laudo de Transformador Obrigatório',
           'O Laudo do Transformador é obrigatório para finalizar a obra.\n\nPor favor, anexe o laudo antes de salvar.',
           [{ text: 'OK' }]
         );
@@ -3728,7 +3755,7 @@ export default function NovaObra() {
           }
 
           Alert.alert(
-            '⚠️ Transformador Instalado - Fotos Faltando',
+            'Transformador Instalado - Fotos Faltando',
             `A obra será salva, mas está INCOMPLETA.\n\n❌ Faltam fotos obrigatórias do transformador instalado:\n\n${mensagens.join('\n')}\n\n💡 Você pode editar a obra depois para adicionar as fotos faltantes.`,
             [
               { text: 'Cancelar e Adicionar Fotos', style: 'cancel' },
@@ -3753,7 +3780,7 @@ export default function NovaObra() {
           }
 
           Alert.alert(
-            '⚠️ Transformador Retirado - Fotos Faltando',
+            'Transformador Retirado - Fotos Faltando',
             `A obra será salva, mas está INCOMPLETA.\n\n❌ Faltam fotos obrigatórias do transformador retirado:\n\n${mensagens.join('\n')}\n\n💡 Você pode editar a obra depois para adicionar as fotos faltantes.`,
             [
               { text: 'Cancelar e Adicionar Fotos', style: 'cancel' },
@@ -3768,7 +3795,7 @@ export default function NovaObra() {
     // 📋 MEDIDOR - CADASTRO OBRIGATÓRIO (exceto Documentação)
     if (!isServicoDocumentacao && isServicoMedidor && docCadastroMedidor.length === 0) {
       Alert.alert(
-        '📋 Cadastro de Medidor Obrigatório',
+        'Cadastro de Medidor Obrigatório',
         'O Cadastro de Medidor é obrigatório para finalizar a obra.\n\nPor favor, anexe o cadastro antes de salvar.',
         [{ text: 'OK' }]
       );
@@ -3798,7 +3825,7 @@ export default function NovaObra() {
 
       if (postesIncompletos.length > 0) {
         Alert.alert(
-          '⚠️ Checklist - Postes Incompletos',
+          'Checklist - Postes Incompletos',
           `A obra será salva, mas está INCOMPLETA.\n\n❌ Faltam fotos obrigatórias em ${postesIncompletos.length} poste(s):\n\n${postesIncompletos.join('\n\n')}\n\n💡 Você pode editar a obra depois para adicionar as fotos faltantes.`,
           [
             { text: 'Cancelar e Adicionar Fotos', style: 'cancel' },
@@ -4221,7 +4248,7 @@ export default function NovaObra() {
 
         const tipoArquivo = isServicoDocumentacao ? 'arquivo(s)' : 'foto(s)';
         Alert.alert(
-          '📱 Salvo Offline',
+          'Salvo Offline',
           `Obra salva localmente com ${totalFotos} ${tipoArquivo} protegida(s).\n\n✅ Todos os arquivos têm backup permanente\n🔄 Será sincronizada automaticamente quando houver internet`,
           [{ text: 'OK', onPress: () => router.back() }]
         );
@@ -4308,7 +4335,7 @@ export default function NovaObra() {
         const totalPhotos = uploadResult.success + uploadResult.failed;
 
         Alert.alert(
-          '⚠️ Atenção - Fotos não enviadas',
+          'Atenção - Fotos não enviadas',
           `${uploadResult.failed} de ${totalPhotos} foto(s) não puderam ser enviadas.\n\nO que deseja fazer?`,
           [
             {
@@ -4826,7 +4853,7 @@ export default function NovaObra() {
           await loadPendingObras();
 
           Alert.alert(
-            '📱 Alterações Salvas Offline',
+            'Alterações Salvas Offline',
             'Obra atualizada localmente.\n\nSerá sincronizada quando houver internet',
             [{ text: 'OK', onPress: () => router.back() }]
           );
@@ -5093,7 +5120,7 @@ export default function NovaObra() {
         : `Obra cadastrada com ${allPhotoIds.length} ${tipoArquivoFinal} enviado(s)!`;
 
       Alert.alert(
-        '✅ Sucesso!',
+        'Sucesso!',
         mensagemSucesso,
         [{ text: 'OK', onPress: () => router.back() }]
       );
@@ -5190,11 +5217,17 @@ export default function NovaObra() {
 
   // ✅ NOVA FUNÇÃO: Pausar obra (salvar rascunho)
   const handlePausar = async () => {
+    // Foto ainda sendo processada (backup e compressão): salvar agora gravaria a obra sem ela e a
+    // foto ficaria órfã no backup. Os botões de foto já respeitam isso; o salvar também deve.
+    if (uploadingPhoto) {
+      showToast('Aguarde a foto terminar de salvar', 'info');
+      return;
+    }
     // ===== VALIDAÇÕES BÁSICAS OBRIGATÓRIAS (SEMPRE) =====
 
     // 0. Equipe obrigatória para admin (validar primeiro, campo visível no topo do form)
     if (isAdminUser && !equipeExecutora) {
-      Alert.alert('❌ Campo Obrigatório', 'Selecione a equipe do lançamento antes de salvar.');
+      Alert.alert('Campo Obrigatório', 'Selecione a equipe do lançamento antes de salvar.');
       return;
     }
 
@@ -5206,13 +5239,13 @@ export default function NovaObra() {
 
     // 1. Data da obra
     if (!data) {
-      Alert.alert('❌ Campo Obrigatório', 'Selecione a data da obra');
+      Alert.alert('Campo Obrigatório', 'Selecione a data da obra');
       return;
     }
 
     // 2. Número da obra
     if (!obra || obra.trim() === '') {
-      Alert.alert('❌ Campo Obrigatório', 'Digite o número da obra');
+      Alert.alert('Campo Obrigatório', 'Digite o número da obra');
       return;
     }
 
@@ -5239,13 +5272,13 @@ export default function NovaObra() {
 
     // 3. Responsável (Encarregado)
     if (!responsavel || responsavel.trim() === '') {
-      Alert.alert('❌ Campo Obrigatório', 'Digite o nome do encarregado/responsável');
+      Alert.alert('Campo Obrigatório', 'Digite o nome do encarregado/responsável');
       return;
     }
 
     // 4. Tipo de Serviço
     if (!tipoServico) {
-      Alert.alert('❌ Campo Obrigatório', 'Selecione o tipo de serviço');
+      Alert.alert('Campo Obrigatório', 'Selecione o tipo de serviço');
       return;
     }
 
@@ -5561,8 +5594,8 @@ export default function NovaObra() {
       }
 
       Alert.alert(
-        '💾 Obra Pausada',
-        'Obra salva como rascunho.\n\nVocê pode continuar editando depois na lista de obras.',
+        'Rascunho salvo',
+        'Você pode continuar editando pela lista de obras.',
         [
           {
             text: 'OK',
@@ -10155,12 +10188,12 @@ export default function NovaObra() {
                   <>
                     {/* Botão principal: Salvar (como rascunho) */}
                     <TouchableOpacity
-                      style={[styles.saveButton, loading && styles.buttonDisabled, { marginBottom: 0 }]}
+                      style={[styles.saveButton, (loading || uploadingPhoto) && styles.buttonDisabled, { marginBottom: 0 }]}
                       onPress={handlePausar}
-                      disabled={loading}
+                      disabled={loading || uploadingPhoto}
                     >
                       <Text style={styles.saveButtonText}>
-                        {loading ? 'Salvando...' : '💾 Salvar'}
+                        {loading ? 'Salvando...' : 'Salvar'}
                       </Text>
                     </TouchableOpacity>
 
@@ -10174,7 +10207,7 @@ export default function NovaObra() {
                           router.replace('/(tabs)');
                         }
                       }}
-                      disabled={loading}
+                      disabled={loading || uploadingPhoto}
                     >
                       <Text style={styles.backButtonText}>← Voltar</Text>
                     </TouchableOpacity>
@@ -10190,12 +10223,12 @@ export default function NovaObra() {
                   <>
                     {/* Botão principal: Salvar alterações */}
                     <TouchableOpacity
-                      style={[styles.saveButton, loading && styles.buttonDisabled, { marginBottom: 0 }]}
+                      style={[styles.saveButton, (loading || uploadingPhoto) && styles.buttonDisabled, { marginBottom: 0 }]}
                       onPress={handlePausar}
-                      disabled={loading}
+                      disabled={loading || uploadingPhoto}
                     >
                       <Text style={styles.saveButtonText}>
-                        {loading ? 'Salvando...' : '💾 Salvar'}
+                        {loading ? 'Salvando...' : 'Salvar'}
                       </Text>
                     </TouchableOpacity>
 
@@ -10549,49 +10582,19 @@ export default function NovaObra() {
       >
         <View style={styles.exitModalOverlay}>
           <View style={styles.exitModalContainer}>
-            {/* Ícone de aviso */}
-            <View style={styles.exitModalIconContainer}>
-              <Text style={styles.exitModalIcon}>⚠️</Text>
-            </View>
-
-            {/* Título */}
-            <Text style={styles.exitModalTitle}>Sair da Obra?</Text>
-
-            {/* Descrição */}
+            <Text style={styles.exitModalTitle}>Sair da obra?</Text>
             <Text style={styles.exitModalDescription}>
-              Você tem dados não salvos. O que deseja fazer com as alterações?
+              Há alterações que ainda não foram salvas.
             </Text>
 
-            {/* Botões */}
-            <View style={styles.exitModalButtons}>
-              {/* Botão Salvar */}
-              <TouchableOpacity
-                style={styles.exitModalButtonSave}
-                onPress={handleExitSave}
-                activeOpacity={0.8}
-              >
-                <Text style={styles.exitModalButtonSaveIcon}>💾</Text>
-                <Text style={styles.exitModalButtonSaveText}>Salvar</Text>
-              </TouchableOpacity>
-
-              {/* Botão Descartar */}
-              <TouchableOpacity
-                style={styles.exitModalButtonDiscard}
-                onPress={handleExitDiscard}
-                activeOpacity={0.8}
-              >
-                <Text style={styles.exitModalButtonDiscardIcon}>🗑️</Text>
-                <Text style={styles.exitModalButtonDiscardText}>Descartar</Text>
-              </TouchableOpacity>
-            </View>
-
-            {/* Botão Cancelar */}
-            <TouchableOpacity
-              style={styles.exitModalButtonCancel}
-              onPress={() => setExitModalVisible(false)}
-              activeOpacity={0.8}
-            >
-              <Text style={styles.exitModalButtonCancelText}>Continuar Editando</Text>
+            <TouchableOpacity style={styles.exitSimpleSave} onPress={handleExitSave} activeOpacity={0.85}>
+              <Text style={styles.exitSimpleSaveText}>Salvar rascunho</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.exitSimpleDiscard} onPress={handleExitDiscard} activeOpacity={0.85}>
+              <Text style={styles.exitSimpleDiscardText}>Descartar alterações</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.exitSimpleCancel} onPress={() => setExitModalVisible(false)} activeOpacity={0.7}>
+              <Text style={styles.exitSimpleCancelText}>Continuar editando</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -10604,9 +10607,15 @@ export default function NovaObra() {
 }
 
 const styles = StyleSheet.create({
+  exitSimpleSave: { backgroundColor: theme.colors.primary, borderRadius: 10, paddingVertical: 13, alignItems: 'center', marginTop: 4 },
+  exitSimpleSaveText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  exitSimpleDiscard: { borderWidth: 1, borderColor: theme.colors.primary, borderRadius: 10, paddingVertical: 12, alignItems: 'center', marginTop: 10 },
+  exitSimpleDiscardText: { color: theme.colors.primary, fontSize: 15, fontWeight: '700' },
+  exitSimpleCancel: { paddingVertical: 12, alignItems: 'center', marginTop: 4 },
+  exitSimpleCancelText: { color: theme.colors.textMuted, fontSize: 14, fontWeight: '600' },
   safeArea: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: theme.colors.background,
   },
   container: {
     flex: 1,
@@ -10621,7 +10630,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderWidth: 1,
     borderColor: '#e8e8e8',
-    borderRadius: 16,
+    borderRadius: theme.radius.card,
     padding: 16,
     flexDirection: 'column',
     alignItems: 'flex-start',
@@ -10660,7 +10669,7 @@ const styles = StyleSheet.create({
   connectionTitle: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#1a1a1a',
+    color: theme.colors.text,
   },
   connectionSubtitle: {
     fontSize: 13,
@@ -10670,10 +10679,10 @@ const styles = StyleSheet.create({
     flexShrink: 1,
   },
   connectionAction: {
-    backgroundColor: '#dc3545',
+    backgroundColor: theme.colors.primary,
     paddingHorizontal: 18,
     paddingVertical: 12,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     alignSelf: 'stretch',
     justifyContent: 'center',
     alignItems: 'center',
@@ -10688,7 +10697,7 @@ const styles = StyleSheet.create({
   },
   pendingContainer: {
     backgroundColor: '#fff',
-    borderRadius: 16,
+    borderRadius: theme.radius.card,
     borderWidth: 1,
     borderColor: '#f0f0f0',
     padding: 16,
@@ -10703,7 +10712,7 @@ const styles = StyleSheet.create({
   pendingTitle: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#1a1a1a',
+    color: theme.colors.text,
   },
   pendingCount: {
     fontSize: 13,
@@ -10745,7 +10754,7 @@ const styles = StyleSheet.create({
   pendingObraName: {
     fontSize: 15,
     fontWeight: '600',
-    color: '#1a1a1a',
+    color: theme.colors.text,
   },
   pendingMeta: {
     fontSize: 13,
@@ -10760,62 +10769,56 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 28,
     fontWeight: 'bold',
-    color: '#1a1a1a',
+    color: theme.colors.text,
     marginBottom: 24,
   },
   inputGroup: {
     marginBottom: 20,
   },
   label: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1a1a1a',
-    marginBottom: 8,
+    ...theme.typography.label,
+    marginBottom: 6,
   },
   sectionLabel: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#1a1a1a',
+    ...theme.typography.sectionTitle,
     marginBottom: 8,
   },
   sectionTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1a1a1a',
+    ...theme.typography.sectionTitle,
     marginTop: 16,
     marginBottom: 12,
   },
   hint: {
-    fontSize: 13,
-    color: '#999',
+    ...theme.typography.hint,
     marginBottom: 8,
   },
   input: {
-    backgroundColor: '#fff',
+    backgroundColor: theme.colors.surfaceMuted,
     borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 12,
-    padding: 16,
-    fontSize: 16,
-    color: '#1a1a1a',
+    borderColor: theme.colors.borderInput,
+    borderRadius: theme.radius.input,
+    paddingHorizontal: 10,
+    paddingVertical: 12,
+    ...theme.typography.input,
   },
   textArea: {
     minHeight: 100,
     paddingTop: 12,
   },
   dropdownButton: {
-    backgroundColor: '#fff',
+    backgroundColor: theme.colors.surfaceMuted,
     borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 12,
-    padding: 16,
+    borderColor: theme.colors.borderInput,
+    borderRadius: theme.radius.input,
+    paddingHorizontal: 10,
+    paddingVertical: 12,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
   },
   dropdownButtonText: {
-    fontSize: 16,
-    color: '#333',
+    fontSize: 15,
+    color: theme.colors.text,
   },
   dropdownIcon: {
     fontSize: 12,
@@ -10840,7 +10843,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   selectedBadge: {
-    backgroundColor: '#ffe6e6',
+    backgroundColor: theme.colors.primarySoft,
     borderRadius: 20,
     paddingHorizontal: 14,
     paddingVertical: 8,
@@ -10850,14 +10853,14 @@ const styles = StyleSheet.create({
   },
   selectedBadgeText: {
     fontSize: 14,
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: '600',
   },
   removeBadge: {
     width: 18,
     height: 18,
     borderRadius: 9,
-    backgroundColor: '#dc3545',
+    backgroundColor: theme.colors.primary,
     justifyContent: 'center',
     alignItems: 'center',
   },
@@ -10872,16 +10875,16 @@ const styles = StyleSheet.create({
   },
   radioButton: {
     flex: 1,
-    backgroundColor: '#fff',
+    backgroundColor: theme.colors.surface,
     borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 8,
+    borderColor: theme.colors.borderInput,
+    borderRadius: theme.radius.input,
     padding: 12,
     alignItems: 'center',
   },
   radioButtonActive: {
-    backgroundColor: '#dc3545',
-    borderColor: '#dc3545',
+    backgroundColor: theme.colors.primary,
+    borderColor: theme.colors.primary,
   },
   radioText: {
     fontSize: 15,
@@ -10916,7 +10919,7 @@ const styles = StyleSheet.create({
   modalTitle: {
     fontSize: 20,
     fontWeight: 'bold',
-    color: '#1a1a1a',
+    color: theme.colors.text,
   },
   modalClose: {
     fontSize: 28,
@@ -10936,7 +10939,7 @@ const styles = StyleSheet.create({
   },
   modalItem: {
     backgroundColor: '#f8f8f8',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 16,
     marginBottom: 8,
     flexDirection: 'row',
@@ -10944,40 +10947,40 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   modalItemActive: {
-    backgroundColor: '#ffe6e6',
+    backgroundColor: theme.colors.primarySoft,
     borderWidth: 2,
-    borderColor: '#dc3545',
+    borderColor: theme.colors.primary,
   },
   modalItemText: {
     fontSize: 16,
     color: '#333',
   },
   modalItemTextActive: {
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: '600',
   },
   modalItemSelected: {
-    backgroundColor: '#ffe6e6',
+    backgroundColor: theme.colors.primarySoft,
     borderWidth: 2,
-    borderColor: '#dc3545',
+    borderColor: theme.colors.primary,
   },
   modalItemTextSelected: {
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: '600',
   },
   checkmark: {
     fontSize: 20,
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: 'bold',
   },
   modalCheckmark: {
     fontSize: 20,
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: 'bold',
   },
   modalButton: {
-    backgroundColor: '#dc3545',
-    borderRadius: 12,
+    backgroundColor: theme.colors.primary,
+    borderRadius: theme.radius.button,
     padding: 16,
     marginHorizontal: 20,
     marginTop: 16,
@@ -10991,8 +10994,8 @@ const styles = StyleSheet.create({
   photoButton: {
     backgroundColor: '#fff',
     borderWidth: 2,
-    borderColor: '#dc3545',
-    borderRadius: 12,
+    borderColor: theme.colors.primary,
+    borderRadius: theme.radius.button,
     padding: 14,
     alignItems: 'center',
     marginBottom: 12,
@@ -11016,7 +11019,7 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: '#fff',
     fontWeight: 'bold',
-    backgroundColor: '#dc3545',
+    backgroundColor: theme.colors.primary,
     width: 36,
     height: 36,
     borderRadius: 18,
@@ -11026,7 +11029,7 @@ const styles = StyleSheet.create({
   },
   scanPlacaButton: {
     backgroundColor: '#10b981',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 16,
     alignItems: 'center',
     marginBottom: 16,
@@ -11049,13 +11052,13 @@ const styles = StyleSheet.create({
   },
   photoButtonText: {
     fontSize: 15,
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: '600',
   },
   photoSectionLabel: {
     fontSize: 15,
     fontWeight: '600',
-    color: '#1a1a1a',
+    color: theme.colors.text,
     marginTop: 16,
     marginBottom: 8,
   },
@@ -11104,7 +11107,7 @@ const styles = StyleSheet.create({
     width: '31%',
     aspectRatio: 1,
     backgroundColor: '#f8f9fa',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     overflow: 'hidden',
     position: 'relative',
     borderWidth: 2,
@@ -11125,8 +11128,8 @@ const styles = StyleSheet.create({
     right: 6,
     width: 32,
     height: 32,
-    borderRadius: 16,
-    backgroundColor: '#dc3545',
+    borderRadius: theme.radius.card,
+    backgroundColor: theme.colors.primary,
     justifyContent: 'center',
     alignItems: 'center',
     shadowColor: '#000',
@@ -11157,8 +11160,8 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
   button: {
-    backgroundColor: '#dc3545',
-    borderRadius: 12,
+    backgroundColor: theme.colors.primary,
+    borderRadius: theme.radius.button,
     padding: 16,
     alignItems: 'center',
     marginTop: 8,
@@ -11201,7 +11204,7 @@ const styles = StyleSheet.create({
   // Botão Finalizar (VERDE)
   finalizarButton: {
     flex: 2,
-    backgroundColor: '#10b981',
+    backgroundColor: theme.colors.primary,
     padding: 16,
     borderRadius: 8,
     alignItems: 'center',
@@ -11215,7 +11218,7 @@ const styles = StyleSheet.create({
   },
   cancelButton: {
     flex: 1,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 16,
     alignItems: 'center',
     backgroundColor: '#6b7280',
@@ -11228,9 +11231,9 @@ const styles = StyleSheet.create({
   // ===== NOVOS ESTILOS UX SIMPLIFICADA =====
   // Botão Salvar (principal para nova obra e rascunhos)
   saveButton: {
-    backgroundColor: '#10b981', // Verde
+    backgroundColor: theme.colors.primary,
     padding: 18,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 12,
@@ -11249,7 +11252,7 @@ const styles = StyleSheet.create({
   backButton: {
     backgroundColor: '#f3f4f6', // Cinza claro
     padding: 16,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
@@ -11262,9 +11265,9 @@ const styles = StyleSheet.create({
   },
   // Botão Adicionar Fotos (para obra existente)
   addPhotosButton: {
-    backgroundColor: '#3b82f6', // Azul
+    backgroundColor: '#DC2626', // Azul
     padding: 18,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 12,
@@ -11280,7 +11283,7 @@ const styles = StyleSheet.create({
   },
   dateDisplay: {
     backgroundColor: '#f8f8f8',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 16,
     marginBottom: 20,
     alignItems: 'center',
@@ -11319,13 +11322,13 @@ const styles = StyleSheet.create({
   },
   dateControlButtonText: {
     fontSize: 18,
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: 'bold',
   },
   dateControlValue: {
     fontSize: 24,
     fontWeight: 'bold',
-    color: '#1a1a1a',
+    color: theme.colors.text,
     paddingVertical: 8,
     minWidth: 50,
     textAlign: 'center',
@@ -11341,11 +11344,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingVertical: 12,
     borderWidth: 1,
-    borderColor: '#dc3545',
+    borderColor: theme.colors.primary,
   },
   dateQuickButtonText: {
     fontSize: 14,
-    color: '#dc3545',
+    color: theme.colors.primary,
     fontWeight: '600',
   },
   modalHeaderLeft: {
@@ -11355,7 +11358,7 @@ const styles = StyleSheet.create({
   },
   countBadge: {
     backgroundColor: '#ff9800',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     paddingHorizontal: 10,
     paddingVertical: 4,
     minWidth: 28,
@@ -11374,11 +11377,11 @@ const styles = StyleSheet.create({
   },
   searchInput: {
     backgroundColor: '#f8f8f8',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 14,
     paddingRight: 45,
     fontSize: 15,
-    color: '#1a1a1a',
+    color: theme.colors.text,
     borderWidth: 1,
     borderColor: '#e0e0e0',
   },
@@ -11389,7 +11392,7 @@ const styles = StyleSheet.create({
     transform: [{ translateY: -6 }],
     width: 24,
     height: 24,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     backgroundColor: '#ddd',
     justifyContent: 'center',
     alignItems: 'center',
@@ -11424,7 +11427,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f5',
     borderWidth: 2,
     borderColor: '#e0e0e0',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     paddingVertical: 16,
     paddingHorizontal: 20,
     alignItems: 'center',
@@ -11445,7 +11448,7 @@ const styles = StyleSheet.create({
   // Estilos do Checklist de Fiscalização
   checklistSection: {
     backgroundColor: '#fff',
-    borderRadius: 16,
+    borderRadius: theme.radius.card,
     padding: 18,
     marginBottom: 18,
     borderWidth: 2,
@@ -11477,7 +11480,7 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     padding: 14,
     backgroundColor: '#f1f5f9',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     borderWidth: 1,
     borderColor: '#e2e8f0',
   },
@@ -11608,20 +11611,20 @@ const styles = StyleSheet.create({
   },
   posteAditivoLabel: {
     fontSize: 14,
-    color: '#dc2626',
+    color: theme.colors.primary,
     marginLeft: 10,
     fontWeight: '500',
     flex: 1,
   },
   posteAditivoLabelActive: {
-    color: '#dc2626',
+    color: theme.colors.primary,
     fontWeight: '600',
   },
   posteAddButtonDisabled: {
     backgroundColor: '#94a3b8',
   },
   posteTagRemoveAditivo: {
-    backgroundColor: '#dc2626',
+    backgroundColor: theme.colors.primary,
   },
   checkbox: {
     width: 24,
@@ -11713,7 +11716,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
     padding: 16,
     backgroundColor: '#f0f9ff',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     borderLeftWidth: 5,
     borderLeftColor: '#0ea5e9',
     shadowColor: '#000',
@@ -11751,7 +11754,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   pontoFotoButton: {
-    backgroundColor: '#3b82f6',
+    backgroundColor: '#DC2626',
     paddingVertical: 10,
     paddingHorizontal: 12,
     borderRadius: 8,
@@ -11825,7 +11828,7 @@ const styles = StyleSheet.create({
   },
   docSection: {
     backgroundColor: '#fff',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 16,
     marginBottom: 16,
     borderWidth: 1,
@@ -11834,7 +11837,7 @@ const styles = StyleSheet.create({
   docSectionTitle: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#1a1a1a',
+    color: theme.colors.text,
     marginBottom: 12,
   },
   docSubtitle: {
@@ -11847,7 +11850,7 @@ const styles = StyleSheet.create({
   docButton: {
     backgroundColor: '#f3f4f6',
     borderWidth: 2,
-    borderColor: '#3b82f6',
+    borderColor: '#DC2626',
     borderRadius: 8,
     padding: 12,
     alignItems: 'center',
@@ -11869,17 +11872,17 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    backgroundColor: '#eff6ff',
+    backgroundColor: '#FEF2F2',
     padding: 12,
     borderRadius: 8,
     marginBottom: 8,
     borderLeftWidth: 4,
-    borderLeftColor: '#3b82f6',
+    borderLeftColor: '#DC2626',
   },
   docFileName: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#1e40af',
+    color: '#991B1B',
     flex: 1,
     marginLeft: 8,
   },
@@ -11914,7 +11917,7 @@ const styles = StyleSheet.create({
   },
   aprSection: {
     backgroundColor: '#fffbeb',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 16,
     borderWidth: 2,
     borderColor: '#fbbf24',
@@ -11976,7 +11979,7 @@ const styles = StyleSheet.create({
     bottom: 40,
     backgroundColor: 'rgba(0, 0, 0, 0.8)',
     padding: 16,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     marginHorizontal: 20,
   },
   photoModalInfoText: {
@@ -11993,7 +11996,7 @@ const styles = StyleSheet.create({
   // Identificação de Postes (Book de Aterramento, Fundação Especial)
   posteIdentificacaoSection: {
     backgroundColor: '#f8fafc',
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     padding: 16,
     marginTop: 12,
     borderWidth: 1,
@@ -12073,7 +12076,7 @@ const styles = StyleSheet.create({
     borderColor: '#ef4444',
   },
   posteTagTextAditivo: {
-    color: '#dc2626',
+    color: theme.colors.primary,
   },
   postePrefixBoxAditivo: {
     backgroundColor: '#fef2f2',
@@ -12081,7 +12084,7 @@ const styles = StyleSheet.create({
     borderWidth: 2,
   },
   postePrefixTextAditivo: {
-    color: '#dc2626',
+    color: theme.colors.primary,
   },
   // Estilos do Modal de Confirmação de Saída
   exitModalOverlay: {
@@ -12140,7 +12143,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#10b981',
     paddingVertical: 14,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'center',
@@ -12163,7 +12166,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#fee2e2',
     paddingVertical: 14,
-    borderRadius: 12,
+    borderRadius: theme.radius.button,
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'center',
@@ -12175,7 +12178,7 @@ const styles = StyleSheet.create({
     fontSize: 18,
   },
   exitModalButtonDiscardText: {
-    color: '#dc2626',
+    color: theme.colors.primary,
     fontSize: 16,
     fontWeight: '700',
   },

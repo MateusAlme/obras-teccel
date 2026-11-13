@@ -82,3 +82,6 @@ $RECYCLE.BIN/
 
 # Credenciais da migracao para a VPS
 scripts/migracao-vps/.env.backup
+
+# build nativo local de desenvolvimento (o EAS gera o dele a partir do app.json)
+/mobile/android

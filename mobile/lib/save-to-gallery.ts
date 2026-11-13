@@ -3,21 +3,26 @@ import * as FileSystem from 'expo-file-system';
 import { Platform, Alert } from 'react-native';
 import { logger } from '../utils/logger';
 
+// Já perguntamos nesta sessão? O Android 13+ mostra um diálogo por permissão de mídia
+// (fotos, vídeos, áudio). Pedir de novo a cada foto fazia o diálogo aparecer em toda captura.
+let galleryPermissionAsked = false;
+
 /**
- * Solicita permissão para salvar fotos na galeria
- * Retorna true se a permissão for concedida
+ * Pede permissão para salvar fotos na galeria, no máximo UMA vez por sessão.
+ * Usa writeOnly: salvar não precisa ler a galeria, então não pede acesso a áudio nem a
+ * "todas as fotos". Se o usuário negar, a cópia na galeria é pulada em silêncio, pois
+ * é só um backup extra (o arquivo principal fica no armazenamento do app).
+ * Retorna true se a permissão estiver concedida.
  */
 export async function requestGalleryPermission(): Promise<boolean> {
   try {
-    // Verifica permissão existente antes de pedir — evita dialog repetido
-    const { status: existing } = await MediaLibrary.getPermissionsAsync();
+    const { status: existing, canAskAgain } = await MediaLibrary.getPermissionsAsync(true);
     if (existing === 'granted') return true;
-    // Só pede se ainda não foi decidido (não pede de novo se o usuário já negou)
-    if (existing === 'undetermined') {
-      const { status } = await MediaLibrary.requestPermissionsAsync();
-      return status === 'granted';
-    }
-    return false;
+    if (galleryPermissionAsked || !canAskAgain) return false;
+
+    galleryPermissionAsked = true;
+    const { status } = await MediaLibrary.requestPermissionsAsync(true);
+    return status === 'granted';
   } catch (error) {
     logger.error('Erro ao solicitar permissão da galeria:', error);
     return false;
@@ -102,7 +107,7 @@ export async function saveMultiplePhotosToGallery(
  */
 export async function hasGalleryPermission(): Promise<boolean> {
   try {
-    const { status } = await MediaLibrary.getPermissionsAsync();
+    const { status } = await MediaLibrary.getPermissionsAsync(true);
     return status === 'granted';
   } catch (error) {
     return false;

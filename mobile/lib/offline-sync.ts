@@ -2,7 +2,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import { supabase } from './supabase';
 import { Alert, InteractionManager } from 'react-native';
-import { backupPhoto, PhotoMetadata, getPendingPhotos, updatePhotosObraId, getAllPhotoMetadata, getPhotoMetadatasByIds as getStoredPhotoMetadatasByIds, pruneArchivedPhotoMetadata, markPhotoAsLost } from './photo-backup';
+import { recuperarFotoPendenteDaCamera } from './camera-recovery';
+import { backupPhoto, PhotoMetadata, getPendingPhotos, updatePhotosObraId, getAllPhotoMetadata, getPhotoMetadatasByIds as getStoredPhotoMetadatasByIds, pruneArchivedPhotoMetadata, markPhotoAsLost, deletePhotoBackup } from './photo-backup';
 import { processObraPhotos, UploadProgress } from './photo-queue';
 import { captureError } from './sentry';
 import { logger } from '../utils/logger';
@@ -232,7 +233,7 @@ const extractPhotoIdFromItem = (item: unknown): string | null => {
   return null;
 };
 
-const collectObraReferencedPhotoIds = (obra: PendingObra): string[] => {
+export const collectObraReferencedPhotoIds = (obra: PendingObra): string[] => {
   const ids = new Set<string>();
 
   const isPhotoArrayKey = (key: string) =>
@@ -2836,6 +2837,8 @@ export const syncAllPendingObras = async (): Promise<{ success: number; failed: 
       return { success: 0, failed: 0 };
     }
 
+    await reconciliarFotosOrfas();
+
     let success = 0;
     let failed = 0;
 
@@ -2934,6 +2937,127 @@ export const syncAllPendingObras = async (): Promise<{ success: number; failed: 
   }
 };
 
+
+/**
+ * Reanexa à obra as fotos que existem no backup mas a obra salva não referencia.
+ *
+ * Como acontece: o auto-save do formulário troca o id da obra de `temp_<ts>` para
+ * `local_<ts>_<x>` e move as fotos existentes. Uma foto tirada nessa janela entra no backup, mas
+ * não na lista da obra salva (campo plano ou poste): o arquivo existe, a obra não o conhece e ele
+ * nunca é enviado. Visto no emulador com Ditais (campo plano) e Fundação Especial (poste).
+ *
+ * Reconhece o dono da foto por `obraId`, que pode ser o id local, o serverId ou o `temp_<ts>`
+ * (o id local carrega o mesmo timestamp). Só acrescenta ids que a obra ainda não referencia;
+ * nunca remove nem troca nada. Roda no início de cada sync, antes de enviar as fotos.
+ */
+let reconciliacaoEmAndamento: Promise<{ reanexadas: number; obras: string[] }> | null = null;
+
+export const reconciliarFotosOrfas = (): Promise<{ reanexadas: number; obras: string[] }> => {
+  // Várias telas chamam isto ao montar; duas execuções ao mesmo tempo leriam a mesma obra e
+  // acrescentariam o mesmo id duas vezes. Quem chega durante uma execução espera a mesma.
+  if (!reconciliacaoEmAndamento) {
+    reconciliacaoEmAndamento = reconciliarFotosOrfasInterno().finally(() => { reconciliacaoEmAndamento = null; });
+  }
+  return reconciliacaoEmAndamento;
+};
+
+const reconciliarFotosOrfasInterno = async (): Promise<{ reanexadas: number; obras: string[] }> => {
+  try {
+    const todas = await getAllPhotoMetadata();
+    const candidatas = todas.filter((m) => !m.lost && !m.uploaded);
+    if (candidatas.length === 0) return { reanexadas: 0, obras: [] };
+
+    const locais = await getLocalObras();
+    const donoPorObraId = new Map<string, LocalObra>();
+    for (const obra of locais) {
+      donoPorObraId.set(obra.id, obra);
+      if ((obra as any).serverId) donoPorObraId.set((obra as any).serverId, obra);
+      const m = String(obra.id || '').match(/^local_(\d+)_/);
+      if (m) donoPorObraId.set(`temp_${m[1]}`, obra);
+    }
+
+    const referencia = (item: any): string | null =>
+      typeof item === 'string' ? item : (item && typeof item.id === 'string' ? item.id : null);
+
+    // Tipos de foto por poste vêm como `<base>_<idDoPoste>` (ex.: depois_P1, antes_AD-P2).
+    const POSTE_BASE: Record<string, string> = {
+      antes: 'fotos_antes',
+      durante: 'fotos_durante',
+      depois: 'fotos_depois',
+      aterramento_medicao: 'fotos_medicao',
+    };
+
+    const porObra = new Map<string, { obra: LocalObra; fotos: PhotoMetadata[] }>();
+    for (const foto of candidatas) {
+      const obra = donoPorObraId.get(foto.obraId);
+      if (!obra) continue; // formulário abandonado sem obra salva: nada a reanexar
+      const grupo = porObra.get(obra.id) || { obra, fotos: [] };
+      grupo.fotos.push(foto);
+      porObra.set(obra.id, grupo);
+    }
+
+    logger.sync(`🔗 [reconciliarFotosOrfas] candidatas=${candidatas.length} obras com candidatas=${porObra.size}`);
+    let reanexadas = 0;
+    const obrasAtualizadas: string[] = [];
+
+    for (const { obra, fotos } of porObra.values()) {
+      const jaReferenciadas = new Set<string>(collectObraReferencedPhotoIds(obra as any));
+      const atualizacoes: Record<string, any> = {};
+      let reanexadasNestaObra = 0;
+
+      for (const foto of fotos) {
+        if (jaReferenciadas.has(foto.id)) continue;
+
+        // 1. Campo plano da obra (fotos_<tipo> ou doc_<tipo>)
+        const campo = foto.type.startsWith('doc_') ? foto.type : `fotos_${foto.type}`;
+        const atualPlano = (atualizacoes[campo] ?? (obra as any)[campo]);
+        if (Array.isArray(atualPlano)) {
+          atualizacoes[campo] = [...atualPlano, foto.id];
+          jaReferenciadas.add(foto.id);
+          reanexadasNestaObra++;
+          continue;
+        }
+
+        // 2. Foto de poste: acrescenta no poste de mesmo id dentro de postes_data
+        const mPoste = foto.type.match(/^(antes|durante|depois|aterramento_medicao)_(.+)$/);
+        if (mPoste) {
+          const base = mPoste[1];
+          const posteId = mPoste[2];
+          const postes: any[] = Array.isArray(atualizacoes.postes_data)
+            ? atualizacoes.postes_data
+            : Array.isArray((obra as any).postes_data)
+              ? (obra as any).postes_data.map((p: any) => ({ ...p }))
+              : [];
+          const alvo = postes.find((p) => String(p?.id) === posteId);
+          const subcampo = POSTE_BASE[base];
+          if (alvo && subcampo) {
+            alvo[subcampo] = [...(Array.isArray(alvo[subcampo]) ? alvo[subcampo] : []), foto.id];
+            atualizacoes.postes_data = postes;
+            jaReferenciadas.add(foto.id);
+            reanexadasNestaObra++;
+          }
+        }
+      }
+
+      // Fotos ainda com id temporário passam para o id local da obra.
+      const temporarios = new Set(fotos.filter((f) => f.obraId.startsWith('temp_')).map((f) => f.obraId));
+      for (const tempId of temporarios) await updatePhotosObraId(tempId, obra.id);
+
+      if (reanexadasNestaObra > 0) {
+        reanexadas += reanexadasNestaObra;
+        await saveObraLocal({ ...obra, ...atualizacoes } as any, obra.id);
+        obrasAtualizadas.push(obra.obra || obra.id);
+        logger.sync(`🔗 [reconciliarFotosOrfas] ${reanexadasNestaObra} foto(s) reanexada(s) à obra ${obra.obra || obra.id}`);
+      }
+    }
+
+    return { reanexadas, obras: obrasAtualizadas };
+  } catch (error) {
+    logger.warn('[reconciliarFotosOrfas] Falha (não crítico):', error);
+    return { reanexadas: 0, obras: [] };
+  }
+};
+
 /**
  * Callback de progresso para sincronização com detalhes em tempo real
  */
@@ -2984,6 +3108,8 @@ export const syncAllPendingObrasWithProgress = async (
       logger.sync('📵 [syncAllPendingObrasWithProgress] Sem conexão, abortando');
       return { success: 0, failed: 0, errors: [] };
     }
+
+    await reconciliarFotosOrfas();
 
     let success = 0;
     let failed = 0;
@@ -3144,6 +3270,11 @@ export const updateSyncStatus = async (): Promise<void> => {
  * Inicia um listener de conectividade para sincronização automática
  */
 export const startAutoSync = (onSyncComplete?: (result: { success: number; failed: number }) => void) => {
+  // Foto que ficou sem vínculo (app fechado no meio da captura) volta para a obra ao abrir a tela,
+  // sem esperar a rede: assim o rascunho já mostra a foto mesmo offline.
+  void recuperarFotoPendenteDaCamera()
+    .then(() => reconciliarFotosOrfas())
+    .then(() => limparRestosLocais());
   return NetInfo.addEventListener(state => {
     if (state.isConnected === true && state.isInternetReachable !== false) {
       // Debounce global: cancela timers anteriores e reagenda (previne múltiplos
@@ -3438,4 +3569,88 @@ export const cleanupAllDuplicates = async (): Promise<{
     logger.error('❌ Erro na limpeza completa:', error);
     throw error;
   }
+};
+
+
+// ---------------------------------------------------------------------------
+// Limpeza local: fotos órfãs de formulário abandonado e rascunhos duplicados
+// ---------------------------------------------------------------------------
+
+const DIAS_ORFA_ABANDONADA = 7;
+const OBRA_ID_FOTO_RECUPERADA = 'recuperada_sem_obra';
+
+/**
+ * Remove o que ficou para trás de formulários abandonados, sem tocar em nada que ainda possa ser
+ * usado:
+ *  - Foto pendente cuja obra não existe mais localmente E que tem mais de 7 dias. Antes disso ela
+ *    ainda pode ser reanexada pela reconciliação (rascunho que o usuário vai retomar).
+ *  - Rascunho local duplicado (mesma obra, equipe e tipo, nunca sincronizado) cujas fotos já estão
+ *    todas no rascunho mais recente. Se o duplicado tiver foto que o mais novo não tem, ele fica.
+ * Fotos recuperadas da câmera sem destino conhecido nunca são apagadas aqui.
+ */
+export const limparRestosLocais = async (): Promise<{ fotosOrfas: number; rascunhosDuplicados: number }> => {
+  const resultado = { fotosOrfas: 0, rascunhosDuplicados: 0 };
+  try {
+    const locais = await getLocalObras();
+
+    // 1. Rascunhos duplicados
+    const grupos = new Map<string, LocalObra[]>();
+    for (const o of locais) {
+      if (o.status !== 'rascunho' || o.synced || (o as any).serverId) continue;
+      const numero = String(o.obra || '').trim();
+      if (!numero) continue;
+      const chave = `${numero}|${String(o.equipe || '').trim()}|${String(o.tipo_servico || '').trim()}`;
+      const lista = grupos.get(chave) || [];
+      lista.push(o);
+      grupos.set(chave, lista);
+    }
+    const removidos = new Set<string>();
+    for (const lista of grupos.values()) {
+      if (lista.length < 2) continue;
+      const ordenada = [...lista].sort((a, b) =>
+        String((b as any).updated_at || b.created_at || '').localeCompare(String((a as any).updated_at || a.created_at || ''))
+      );
+      const principal = ordenada[0];
+      const fotosPrincipal = new Set<string>(collectObraReferencedPhotoIds(principal as any));
+      for (const duplicado of ordenada.slice(1)) {
+        const fotosDup = collectObraReferencedPhotoIds(duplicado as any);
+        if (!fotosDup.every((id) => fotosPrincipal.has(id))) continue; // tem foto que só ele conhece
+        try {
+          await updatePhotosObraId(duplicado.id, principal.id);
+          await obraStore.removeObra(duplicado.id);
+          removidos.add(duplicado.id);
+          resultado.rascunhosDuplicados += 1;
+        } catch (e) {
+          logger.warn?.(`[limparRestosLocais] não removeu duplicado ${duplicado.id}`, e);
+        }
+      }
+    }
+
+    // 2. Fotos órfãs antigas
+    const donos = new Set<string>();
+    for (const o of locais) {
+      if (removidos.has(o.id)) continue;
+      donos.add(o.id);
+      if ((o as any).serverId) donos.add((o as any).serverId);
+      const m = String(o.id || '').match(/^local_(\d+)_/);
+      if (m) donos.add(`temp_${m[1]}`);
+    }
+    const limite = Date.now() - DIAS_ORFA_ABANDONADA * 24 * 60 * 60 * 1000;
+    for (const foto of await getAllPhotoMetadata()) {
+      if (foto.lost || foto.uploaded) continue;
+      if (foto.obraId === OBRA_ID_FOTO_RECUPERADA || donos.has(foto.obraId)) continue;
+      const quando = Date.parse(foto.timestamp);
+      if (!Number.isFinite(quando) || quando > limite) continue;
+      await markPhotoAsLost(foto.id, 'orfa_abandonada');
+      await deletePhotoBackup(foto.id);
+      resultado.fotosOrfas += 1;
+    }
+
+    if (resultado.fotosOrfas || resultado.rascunhosDuplicados) {
+      logger.sync(`🧹 [limparRestosLocais] ${resultado.fotosOrfas} foto(s) órfã(s), ${resultado.rascunhosDuplicados} rascunho(s) duplicado(s)`);
+    }
+  } catch (error) {
+    logger.error('[limparRestosLocais] falha:', error);
+  }
+  return resultado;
 };

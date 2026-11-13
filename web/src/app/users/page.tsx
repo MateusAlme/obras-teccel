@@ -4,10 +4,7 @@ import { useEffect, useState } from 'react'
 import ProtectedRoute from '@/components/ProtectedRoute'
 import AppShell from '@/components/AppShell'
 import { useAuth } from '@/contexts/AuthContext'
-<<<<<<< HEAD
-=======
 import { authFetch } from '@/lib/api-client'
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
 import { format } from 'date-fns'
 import { ptBR } from 'date-fns/locale'
 import Image from 'next/image'
@@ -51,11 +48,7 @@ export default function UsersPage() {
   async function loadUsers() {
     try {
       setLoading(true)
-<<<<<<< HEAD
-      const response = await fetch('/api/admin/users')
-=======
       const response = await authFetch('/api/admin/users')
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
       const contentType = response.headers.get('content-type')
       if (!contentType || !contentType.includes('application/json')) {
         throw new Error('Resposta inválida do servidor.')
@@ -83,11 +76,7 @@ export default function UsersPage() {
           setSubmitting(false)
           return
         }
-<<<<<<< HEAD
-        const response = await fetch('/api/admin/users', {
-=======
         const response = await authFetch('/api/admin/users', {
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -101,11 +90,7 @@ export default function UsersPage() {
         if (!result.success) throw new Error(result.error || 'Erro ao criar usuário')
         setSuccess(`Usuário "${formData.email}" criado com sucesso!`)
       } else {
-<<<<<<< HEAD
-        const response = await fetch(`/api/admin/users/${selectedUser!.id}`, {
-=======
         const response = await authFetch(`/api/admin/users/${selectedUser!.id}`, {
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -131,11 +116,7 @@ export default function UsersPage() {
   async function handleDelete(user: AdminUser) {
     if (!confirm(`Excluir o usuário "${user.email}"?\n\nEsta ação não pode ser desfeita!`)) return
     try {
-<<<<<<< HEAD
-      const response = await fetch(`/api/admin/users/${user.id}`, { method: 'DELETE' })
-=======
       const response = await authFetch(`/api/admin/users/${user.id}`, { method: 'DELETE' })
->>>>>>> 4d8d81ab1139b72c3df1b9bf1140f108dd880ef6
       const result = await response.json()
       if (!result.success) throw new Error(result.error || 'Erro ao excluir usuário')
       setSuccess(`Usuário "${user.email}" excluído com sucesso!`)

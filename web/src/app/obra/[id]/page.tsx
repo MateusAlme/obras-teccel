@@ -912,6 +912,13 @@ export default function ObraDetailPage() {
         fotos_transformador_antes_retirar: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_antes_retirar),
         fotos_transformador_tombamento_retirado: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_tombamento_retirado),
         fotos_transformador_placa_retirado: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_placa_retirado),
+        // Estes cinco campos eram lidos sem passar pela conversão: ficavam sem normalizar
+        // utm/placa e sem o filtro de URL local (file:///), ao contrário dos demais.
+        fotos_transformador_laudo_retirado: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_laudo_retirado),
+        fotos_transformador_conexoes_primarias_instalado: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_conexoes_primarias_instalado),
+        fotos_transformador_conexoes_secundarias_instalado: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_conexoes_secundarias_instalado),
+        fotos_transformador_conexoes_primarias_retirado: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_conexoes_primarias_retirado),
+        fotos_transformador_conexoes_secundarias_retirado: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_transformador_conexoes_secundarias_retirado),
         fotos_medidor_padrao: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_medidor_padrao),
         fotos_medidor_leitura: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_medidor_leitura),
         fotos_medidor_selo_born: convertPhotoIdsToFotoInfo(dataForDisplay.fotos_medidor_selo_born),
